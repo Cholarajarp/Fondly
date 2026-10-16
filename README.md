@@ -19,6 +19,8 @@ Built for the **Qloo Agentic Hackathon**.
 - **Names stay in the browser.** Resident names live in localStorage. The server, Qloo and Gemini see only aliases (`r1`, `r2`…) and the public cultural favorites. No health data is collected.
 - **It always finishes.** If Gemini fails or runs out of time, a deterministic pipeline completes the plan from Qloo data.
 
+- **Ready to run Monday.** Each session opens a kit: Qloo facts, YouTube/Spotify/library/map search links, a 60-second read-aloud, conversation prompts, adaptation tips and a gentle quiz, plus a large-print handout. Gemini writes only from the Qloo facts and the kit is cached, so reopening it is instant and free. The week exports as an `.ics` calendar and a one-page noticeboard poster with no resident names.
+
 ## How it works
 
 ```text
@@ -55,6 +57,8 @@ Design details are in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | Re-plan (edit or next week) | `POST /api/plans/:id/replan` (SSE) | Public, rate limited |
 | Intake notes to favorites | `POST /api/intake` | Public, rate limited |
 | Saved plan | `GET /api/plans/:id` | Public, by UUID |
+| Session kit (facts, links, read-aloud, prompts, quiz) | `POST /api/plans/:id/sessions/:sid/kit` | Public, rate limited, cached per session |
+| Calendar file and noticeboard poster | `fondly-week.ics` download and print view, built in the browser | Public |
 
 ## Run it locally
 

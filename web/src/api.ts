@@ -1,4 +1,4 @@
-import type { AgentEvent, IntakeResult, PlanRequest, ReplanRequest, WeekPlan } from "../../shared/types";
+import type { AgentEvent, IntakeResult, PlanRequest, ReplanRequest, SessionKitResponse, WeekPlan } from "../../shared/types";
 
 export interface Health {
   ok: boolean;
@@ -47,6 +47,8 @@ async function send<T>(url: string, init: RequestInit = {}): Promise<T> {
 
 export const getHealth = (signal?: AbortSignal) => send<Health>("/api/health", { signal });
 export const getPlan = (id: string, signal?: AbortSignal) => send<WeekPlan>(`/api/plans/${encodeURIComponent(id)}`, { signal });
+export const getSessionKit = (planId: string, slotId: string, signal?: AbortSignal) =>
+  send<SessionKitResponse>(`/api/plans/${encodeURIComponent(planId)}/sessions/${encodeURIComponent(slotId)}/kit`, { method: "POST", body: "{}", signal });
 export const parseIntake = (notes: string, signal?: AbortSignal) =>
   send<IntakeResult>("/api/intake", { method: "POST", body: JSON.stringify({ notes }), signal });
 

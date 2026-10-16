@@ -327,3 +327,42 @@ export interface IntakeResult {
 /** Fit at or above this counts as a strong match ("reached"). Fits are rank-based, so this means
  * "among roughly the top fifth of this week's options for that resident". */
 export const REACH_THRESHOLD = 0.8;
+
+// ---------------------------------------------------------------------------
+// Session kits (ready-to-run material per session)
+// ---------------------------------------------------------------------------
+
+export interface SessionKitQuizItem {
+  question: string;
+  answer: string;
+}
+
+/**
+ * Read-aloud material for one scheduled session, generated once per plan + slot and cached on the
+ * server. Facts and media links are not stored here: the browser builds them from the Qloo entity.
+ */
+export interface SessionKit {
+  planId: string;
+  slotId: string;
+  /** Qloo entity the kit was written for. */
+  entityId: string;
+  /** "gemini": written by the language model and checked by code. "template": deterministic fallback. */
+  source: "gemini" | "template";
+  /** User-safe reason the template was used, when source is "template". */
+  fallbackReason?: string;
+  createdAt: string;
+  /** About 60 seconds read aloud. */
+  intro: string;
+  /** Exactly 5 reminiscence / conversation prompts. */
+  prompts: string[];
+  /** Simple sensory and adaptation tips for mixed abilities. No medical advice. */
+  adaptations: string[];
+  /** Exactly 3 gentle quiz questions. */
+  quiz: SessionKitQuizItem[];
+}
+
+export interface SessionKitResponse {
+  kit: SessionKit;
+  /** True when the kit came from the server cache (no language-model call). */
+  cached: boolean;
+}

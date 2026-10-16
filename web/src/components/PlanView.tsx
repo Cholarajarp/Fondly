@@ -3,6 +3,9 @@ import { DAYS, TIMES, type Reaction, type ScheduledSession, type WeekPlan } from
 import { nameOf, type Roster } from "../roster";
 import { Markdown } from "./Markdown";
 import { DOMAIN_LABEL, initials } from "./RosterEditor";
+import { SLOT_TIMES } from "../../../shared/ics";
+import { printSheet } from "./Modal";
+import { downloadIcs, KitDialog, NoticeboardPoster } from "./SessionKit";
 
 const DAY_LONG: Record<string, string> = { Mon: "Monday", Tue: "Tuesday", Wed: "Wednesday", Thu: "Thursday", Fri: "Friday", Sat: "Saturday", Sun: "Sunday" };
 const pct = (n: number) => `${Math.round(n * 100)}%`;
@@ -133,7 +136,7 @@ function Thumb({ s }: { s: ScheduledSession }) {
   );
 }
 
-function SessionCard({ s, roster }: { s: ScheduledSession; roster: Roster }) {
+function SessionCard({ s, roster, onOpenKit }: { s: ScheduledSession; roster: Roster; onOpenKit: (slotId: string) => void }) {
   const strong = s.matches.length;
   return (
     <article className={`session dom-${s.domain}`} aria-labelledby={`ses-${s.slotId}`}>
@@ -169,6 +172,9 @@ function SessionCard({ s, roster }: { s: ScheduledSession; roster: Roster }) {
           ))}
         </ul>
       )}
+      <button type="button" className="btn btn-ghost btn-sm kit-open no-print" onClick={() => onOpenKit(s.slotId)} aria-label={`Open session kit for ${s.title || s.entity.name}`}>
+        Open kit
+      </button>
       <details>
         <summary>Staff brief</summary>
         <Markdown source={s.brief} />
@@ -480,6 +486,17 @@ export function PlanView({ plan, roster, onReplan, onEditRoster, busy, disabledR
     ...(mine ? [{ id: "next" as Tab, label: "Next week" }] : []),
   ];
   const homeName = plan.request.homeName || roster.homeName;
+  const [kitSlot, setKitSlot] = useState<string | null>(null);
+  const kitSession = kitSlot ? plan.sessions.find((s) => s.slotId === kitSlot) : undefined;
+  const [exportMsg, setExportMsg] = useState("");
+  const addToCalendar = () => {
+    try {
+      const monday = downloadIcs(plan);
+      setExportMsg(`Downloaded fondly-week.ics for the week of ${monday.toLocaleDateString(undefined, { day: "numeric", month: "long" })}.`);
+    } catch {
+      setExportMsg("Could not create the calendar file in this browser.");
+    }
+  };
 
   return (
     <article className="plan" aria-labelledby="plan-h">
@@ -498,6 +515,16 @@ export function PlanView({ plan, roster, onReplan, onEditRoster, busy, disabledR
           <button type="button" className="btn btn-ghost" onClick={() => window.print()}>
             Print
           </button>
+          {sessions.length > 0 && (
+            <>
+              <button type="button" className="btn btn-ghost" onClick={addToCalendar} aria-describedby="export-note">
+                Add to calendar
+              </button>
+              <button type="button" className="btn btn-ghost" onClick={() => printSheet("poster")} aria-describedby="export-note">
+                Noticeboard poster
+              </button>
+            </>
+          )}
           {mine && (
             <button type="button" className="btn btn-ghost" onClick={onEditRoster}>
               Edit roster
@@ -505,6 +532,16 @@ export function PlanView({ plan, roster, onReplan, onEditRoster, busy, disabledR
           )}
         </div>
       </div>
+
+      {sessions.length > 0 && (
+        <p id="export-note" className="hint no-print export-note">
+          Calendar and poster use next week, Monday to Sunday, at {SLOT_TIMES.morning.label} for mornings, {SLOT_TIMES.afternoon.label} for afternoons and{" "}
+          {SLOT_TIMES.evening.label} for evenings. The poster shows no resident names.
+          <span role="status" className="export-status">
+            {exportMsg ? ` ${exportMsg}` : ""}
+          </span>
+        </p>
+      )}
 
       {!mine && <p className="notice">This plan was made on another device, so residents show as aliases (r1, r2…). Names never leave the device they were entered on.</p>}
 
@@ -533,7 +570,7 @@ export function PlanView({ plan, roster, onReplan, onEditRoster, busy, disabledR
         )}
         <div className="cal">
           {sessions.map((s) => (
-            <SessionCard key={s.slotId} s={s} roster={view} />
+            <SessionCard key={s.slotId} s={s} roster={view} onOpenKit={setKitSlot} />
           ))}
         </div>
         {plan.notes.length > 0 && (
@@ -572,6 +609,9 @@ export function PlanView({ plan, roster, onReplan, onEditRoster, busy, disabledR
           <NextWeek plan={plan} roster={view} onReplan={onReplan} busy={busy} disabledReason={disabledReason} />
         </div>
       )}
+
+      {kitSession && <KitDialog plan={plan} s={kitSession} onClose={() => setKitSlot(null)} />}
+      {sessions.length > 0 && <NoticeboardPoster plan={plan} />}
 
       <p className="footnote">
         Matches are Qloo's aggregate taste affinities, ranked per resident. They describe taste, not health or ability, and do not replace knowing the person. Always
