@@ -1,4 +1,17 @@
-import type { AgentEvent, IntakeResult, PlanRequest, ReplanRequest, WeekPlan } from "../../shared/types";
+import type {
+  AgentEvent,
+  CreatedInvite,
+  FamilyInviteView,
+  FamilySubmission,
+  FamilySuggestion,
+  FavoriteKind,
+  IntakeResult,
+  InviteStatus,
+  InviteStatusResult,
+  PlanRequest,
+  ReplanRequest,
+  WeekPlan,
+} from "../../shared/types";
 
 export interface Health {
   ok: boolean;
@@ -46,6 +59,21 @@ async function send<T>(url: string, init: RequestInit = {}): Promise<T> {
 }
 
 export const getHealth = (signal?: AbortSignal) => send<Health>("/api/health", { signal });
+
+// Family taste link. Secrets go in a header or JSON body, never the URL path, so logs never see them.
+const familyHeaders = (token: string) => ({ "X-Family-Token": token });
+export const createInvite = (residentId: string) =>
+  send<CreatedInvite>("/api/invites", { method: "POST", body: JSON.stringify({ residentId }) });
+export const getInviteStatuses = (invites: { token: string; manageKey: string }[], signal?: AbortSignal) =>
+  send<{ invites: InviteStatusResult[] }>("/api/invites/status", { method: "POST", body: JSON.stringify({ invites }), signal });
+export const markInviteReviewed = (token: string, manageKey: string) =>
+  send<{ status: InviteStatus }>("/api/invites/review", { method: "POST", body: JSON.stringify({ token, manageKey }) });
+export const getFamilyInvite = (token: string, signal?: AbortSignal) =>
+  send<FamilyInviteView>("/api/family", { headers: familyHeaders(token), signal });
+export const submitFamily = (token: string, submission: FamilySubmission) =>
+  send<{ status: InviteStatus; submittedAt: string }>("/api/family", { method: "PUT", headers: familyHeaders(token), body: JSON.stringify(submission) });
+export const searchFamily = (token: string, kind: FavoriteKind, q: string, signal?: AbortSignal) =>
+  send<{ results: FamilySuggestion[] }>(`/api/family/search?${new URLSearchParams({ kind, q })}`, { headers: familyHeaders(token), signal });
 export const getPlan = (id: string, signal?: AbortSignal) => send<WeekPlan>(`/api/plans/${encodeURIComponent(id)}`, { signal });
 export const parseIntake = (notes: string, signal?: AbortSignal) =>
   send<IntakeResult>("/api/intake", { method: "POST", body: JSON.stringify({ notes }), signal });

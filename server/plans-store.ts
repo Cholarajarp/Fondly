@@ -14,7 +14,7 @@ export function isValidPlanId(id: unknown): id is string {
   return typeof id === "string" && UUID_RE.test(id);
 }
 
-async function atomicWriteJson(file: string, data: unknown): Promise<void> {
+export async function atomicWriteJson(file: string, data: unknown): Promise<void> {
   await fs.mkdir(path.dirname(file), { recursive: true });
   const tmp = `${file}.${process.pid}.${randomUUID()}.tmp`;
   await fs.writeFile(tmp, JSON.stringify(data), "utf8");
@@ -24,6 +24,36 @@ async function atomicWriteJson(file: string, data: unknown): Promise<void> {
     await fs.rm(tmp, { force: true });
     throw err;
   }
+}
+
+/**
+ * Deletes `.json` files in `dir` last written more than `maxAgeMs` ago, and all but the newest
+ * `maxFiles`. Returns how many were removed. A missing directory is a no-op.
+ */
+export async function pruneJsonDir(dir: string, maxAgeMs: number, maxFiles: number, now = Date.now()): Promise<number> {
+  let names: string[];
+  try {
+    names = (await fs.readdir(dir)).filter((n) => n.endsWith(".json"));
+  } catch {
+    return 0;
+  }
+  const files = (
+    await Promise.all(
+      names.map(async (n) => {
+        const file = path.join(dir, n);
+        try {
+          return { file, mtime: (await fs.stat(file)).mtimeMs };
+        } catch {
+          return null;
+        }
+      }),
+    )
+  ).filter((x): x is { file: string; mtime: number } => !!x);
+  files.sort((a, b) => b.mtime - a.mtime);
+  const cutoff = now - maxAgeMs;
+  const doomed = files.filter((f, i) => i >= maxFiles || f.mtime < cutoff);
+  await Promise.all(doomed.map((f) => fs.rm(f.file, { force: true })));
+  return doomed.length;
 }
 
 export interface RetentionOptions {
@@ -53,29 +83,7 @@ export function createPlansStore(dir: string, opts: RetentionOptions = {}): Plan
 
   async function prune(): Promise<number> {
     lastPrune = Date.now();
-    let names: string[];
-    try {
-      names = (await fs.readdir(plansDir)).filter((n) => n.endsWith(".json"));
-    } catch {
-      return 0;
-    }
-    const files = (
-      await Promise.all(
-        names.map(async (n) => {
-          const file = path.join(plansDir, n);
-          try {
-            return { file, mtime: (await fs.stat(file)).mtimeMs };
-          } catch {
-            return null;
-          }
-        }),
-      )
-    ).filter((x): x is { file: string; mtime: number } => !!x);
-    files.sort((a, b) => b.mtime - a.mtime);
-    const cutoff = Date.now() - maxAgeMs;
-    const doomed = files.filter((f, i) => i >= maxPlans || f.mtime < cutoff);
-    await Promise.all(doomed.map((f) => fs.rm(f.file, { force: true })));
-    return doomed.length;
+    return pruneJsonDir(plansDir, maxAgeMs, maxPlans);
   }
 
   return {

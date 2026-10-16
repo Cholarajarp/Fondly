@@ -308,3 +308,62 @@ export interface IntakeResult {
 /** Fit at or above this counts as a strong match ("reached"). Fits are rank-based, so this means
  * "among roughly the top fifth of this week's options for that resident". */
 export const REACH_THRESHOLD = 0.8;
+
+// ---------------------------------------------------------------------------
+// Family taste link
+// ---------------------------------------------------------------------------
+
+/**
+ * One cultural item a family member suggests. `entityId` is set when they picked a Qloo
+ * suggestion (a Qloo tag id for food). No free-text notes: nothing personal can be submitted.
+ */
+export interface FamilyItem {
+  kind: FavoriteKind;
+  text: string;
+  entityId?: string;
+}
+
+export interface FamilySubmission {
+  favorites: FamilyItem[];
+  /** Things to keep out of their sessions. Always picked Qloo entities, never food or health notes. */
+  avoid: FamilyItem[];
+}
+
+/** waiting: link sent, nothing back yet. received: family answered. reviewed: coordinator added or dismissed it. */
+export type InviteStatus = "waiting" | "received" | "reviewed";
+
+/** What the family page sees (token holder). Holds no resident alias or name. */
+export interface FamilyInviteView {
+  status: InviteStatus;
+  expiresAt: string;
+  submission?: FamilySubmission;
+}
+
+/** What the coordinator sees for each of their invites (token + manage key holder). */
+export interface InviteStatusResult {
+  token: string;
+  found: boolean;
+  expired?: boolean;
+  status?: InviteStatus;
+  residentId?: string;
+  expiresAt?: string;
+  submittedAt?: string;
+  submission?: FamilySubmission;
+}
+
+export interface CreatedInvite {
+  token: string;
+  /** Second secret, kept by the coordinator only: required to read status and mark an invite reviewed. */
+  manageKey: string;
+  residentId: string;
+  createdAt: string;
+  expiresAt: string;
+}
+
+/** A Qloo suggestion for the family autocomplete. */
+export interface FamilySuggestion {
+  id: string;
+  name: string;
+  /** Year or place, to tell same-named items apart. */
+  detail?: string;
+}

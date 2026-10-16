@@ -67,7 +67,7 @@ function MoonIcon() {
   );
 }
 
-function ThemeToggle() {
+export function ThemeToggle() {
   const [theme, setTheme] = useTheme();
   const next = theme === "dark" ? "light" : "dark";
   return (
