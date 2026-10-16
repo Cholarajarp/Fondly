@@ -197,6 +197,12 @@ The tracer logs swallowed Qloo failures with status and a clipped, already-redac
 
 Finished plans are saved by `server/plans-store.ts` as `<CACHE_DIR>/plans/<uuid>.json`. Writes go to a temp file and are renamed into place. Plan ids must be UUIDs, checked before any file path is built. After a save, at most every 10 minutes, plans older than 90 days or beyond the newest 5,000 are pruned. Saved plans hold aliases and public favorites, never names. Entities are slimmed to 8 tags to keep files small.
 
+## Session kits and exports
+
+`POST /api/plans/:id/sessions/:sid/kit` (`server/routes/kits.ts`) builds a kit for one session of a saved plan. Facts and media links come from the Qloo entity in code (`shared/kit.ts`): name, year, description, tags, image, and search URLs (YouTube and Spotify for music, YouTube trailer for film/TV, Open Library for books, Google Maps for outings with an address). Gemini (`server/kits/generate.ts`) writes the read-aloud intro, 5 prompts, adaptation tips and a 3-question quiz as Zod-validated structured output, grounded on those facts only. Output that adds years not in the facts, medical terms or resident details is rejected. On failure a deterministic template kit is returned, marked `source: "template"`, and not cached so a later open can retry. Gemini kits are stored as `<CACHE_DIR>/kits/<planId>/<sid>.json` (`server/kits/store.ts`) and returned with `cached: true` on later calls. Kit generation has its own hourly per-IP limit and daily cap; cache hits still pass a looser per-IP request limit.
+
+The `.ics` file (`shared/ics.ts`) and noticeboard poster are built in the browser. The calendar has one VEVENT per session with a stable UID, RFC 5545 escaping, CRLF line endings and folding at 75 octets. Plans store only a weekday and part of day, so events land on the upcoming Monday-to-Sunday (the next Monday after today, local time) at the slot times, as floating local times with no time zone. The poster shows day, time, title and a short line, with no resident names or fits.
+
 ## Access and limits
 
 The public demo has no authentication, so judges can use it without logging in. Abuse is bounded by limits in `server/routes/plan.ts`:

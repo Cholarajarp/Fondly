@@ -14,7 +14,7 @@ export function isValidPlanId(id: unknown): id is string {
   return typeof id === "string" && UUID_RE.test(id);
 }
 
-async function atomicWriteJson(file: string, data: unknown): Promise<void> {
+export async function atomicWriteJson(file: string, data: unknown): Promise<void> {
   await fs.mkdir(path.dirname(file), { recursive: true });
   const tmp = `${file}.${process.pid}.${randomUUID()}.tmp`;
   await fs.writeFile(tmp, JSON.stringify(data), "utf8");

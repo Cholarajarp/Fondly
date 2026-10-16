@@ -11,9 +11,14 @@ import { config, missingKeys as defaultMissingKeys } from "./config.ts";
 import { createPlansStore, type PlansStore } from "./plans-store.ts";
 import { createHealthRouter } from "./routes/health.ts";
 import { createPlanRouter, type RunAgent } from "./routes/plan.ts";
+import { createKitRouter } from "./routes/kits.ts";
+import { createKitStore, type KitStore } from "./kits/store.ts";
 
 export interface AppDeps {
   store?: PlansStore;
+  kitStore?: KitStore;
+  /** Gemini kit generations per IP per hour (cache hits are free). Defaults to 3x the plan limit. */
+  kitPerHourLimit?: number;
   getQloo?: () => QlooClient;
   getGemini?: () => GeminiClient;
   runAgent?: RunAgent;
@@ -105,6 +110,21 @@ export function createApp(deps: AppDeps = {}): Express {
       dailyCap: deps.dailyCap ?? config.DAILY_PLAN_CAP,
       maxConcurrent: deps.maxConcurrent ?? 3,
       heartbeatMs: deps.heartbeatMs,
+    }),
+  );
+
+  const perHour = deps.perHourLimit ?? config.PUBLIC_RATE_LIMIT_PER_HOUR;
+  const daily = deps.dailyCap ?? config.DAILY_PLAN_CAP;
+  app.use(
+    "/api",
+    createKitRouter({
+      plans: store,
+      kits: deps.kitStore ?? createKitStore(config.CACHE_DIR),
+      getGemini: deps.getGemini ?? (() => notConfigured("Gemini")),
+      llmConfigured: deps.llmConfigured ?? (() => !missingKeys().includes("GEMINI_API_KEY")),
+      perHourLimit: deps.kitPerHourLimit ?? perHour * 3,
+      // A plan has at most 21 sessions; allow a kit for every session of every daily plan.
+      dailyCap: daily * 21,
     }),
   );
 
