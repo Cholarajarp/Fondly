@@ -1,0 +1,36 @@
+# Render Blueprint: one web service (Starter plan, no cold starts) with a persistent disk
+# for the private Qloo response cache and saved plans.
+services:
+  - type: web
+    name: fondly
+    runtime: node
+    plan: starter
+    region: oregon
+    # --include=dev: NODE_ENV=production would otherwise skip vite/tsx needed to build and start.
+    buildCommand: npm ci --include=dev && npm run build
+    startCommand: npm start
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: NODE_VERSION
+        value: 22.20.0
+      - key: QLOO_BASE_URL
+        value: https://hackathon.api.qloo.com
+      - key: QLOO_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-3.1-flash-lite
+      - key: GEMINI_THINKING
+        value: low
+      - key: CACHE_DIR
+        value: /var/data/cache
+      - key: PUBLIC_RATE_LIMIT_PER_HOUR
+        value: "20"
+    disk:
+      name: fondly-data
+      mountPath: /var/data
+      sizeGB: 1
