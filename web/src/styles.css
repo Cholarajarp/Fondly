@@ -412,7 +412,17 @@ input:focus-visible, select:focus-visible, textarea:focus-visible { outline: 3px
   .site-header, .plan-actions, .tabs, .replan, .skip, .no-print { display: none !important; }
   body { background: #fff; color: #000; font-size: 12pt; }
   .card, .session, .person { box-shadow: none; break-inside: avoid; }
-  .tab-panel[hidden] { display: grid !important; }
+  /* Chrome overlaps grid rows that fragment across pages; flow layout paginates cleanly. */
+  main, .tab-panel:not(.no-print), .tab-panel[hidden]:not(.no-print) { display: block !important; }
+  main > *, .tab-panel > * { margin-bottom: 1rem; }
+  .people { display: block; }
+  .person { display: block; margin-bottom: 0.8rem; }
+  .person > * + * { margin-top: 0.5rem; }
+  .grid-2 { display: block; }
+  .grid-2 > * + * { margin-top: 1rem; }
+  .tab-panel + .tab-panel { break-before: page; }
+  .tab-panel::before { content: attr(data-print-title); display: block; font-weight: 700; font-size: 14pt; margin-bottom: 0.6rem; }
+  .footnote { break-inside: avoid; margin-top: 1.5rem; }
 }
 
 @media (max-width: 900px) {

@@ -14,6 +14,9 @@ import { MAX_TAKE, toQuery, validateInsightsParams, type InsightsParams } from "
 
 export const DEFAULT_BASE_URL = "https://hackathon.api.qloo.com";
 const MAX_ATTEMPTS = 3;
+/** Rate limits get more patience: the hackathon API sends no Retry-After, and a burst clears in seconds. */
+const MAX_ATTEMPTS_429 = 6;
+const RATE_LIMIT_BASE_MS = 2_000;
 const MAX_CONCURRENCY = 4;
 const RETRY_AFTER_CAP_MS = 10_000;
 
@@ -242,8 +245,11 @@ export function createQlooClient(opts: QlooClientOptions = {}): QlooClient {
   const cache = opts.cache;
   const timeoutMs = opts.timeoutMs ?? 15_000;
   const retryBaseMs = opts.retryBaseMs ?? 500;
+  const rateLimitBaseMs = opts.retryBaseMs === undefined ? RATE_LIMIT_BASE_MS : retryBaseMs * 4;
   const limit = createSemaphore(MAX_CONCURRENCY);
   let calls = 0;
+  // Shared cooldown: after any 429, every queued call waits until this time instead of re-bursting.
+  let coolUntil = 0;
 
   const redact = (s: string) => (apiKey ? s.split(apiKey).join("[REDACTED]") : s);
   const err = (message: string, status: number, path: string) => new QlooError(redact(message), status, path);
@@ -321,9 +327,11 @@ export function createQlooClient(opts: QlooClientOptions = {}): QlooClient {
     const url = `${baseUrl}${path}${qs ? `?${qs}` : ""}`;
 
     let lastError: QlooError | undefined;
-    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    for (let attempt = 0; ; attempt++) {
       let retryAfter: string | null = null;
       const outcome = await limit(async (): Promise<{ body: unknown } | { error: QlooError; retry: boolean }> => {
+        const wait = coolUntil - Date.now();
+        if (wait > 0) await sleep(wait);
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), timeoutMs);
         try {
@@ -363,8 +371,15 @@ export function createQlooClient(opts: QlooClientOptions = {}): QlooClient {
         return value;
       }
       lastError = outcome.error;
-      if (!outcome.retry || attempt === MAX_ATTEMPTS - 1) break;
-      await sleep(backoffMs(attempt, retryAfter));
+      const limited = outcome.error.status === 429;
+      if (!outcome.retry || attempt >= (limited ? MAX_ATTEMPTS_429 : MAX_ATTEMPTS) - 1) break;
+      if (limited && retryAfter === null) {
+        const delay = Math.min(rateLimitBaseMs * 2 ** attempt, 16_000) * (1 + Math.random() * 0.25);
+        coolUntil = Math.max(coolUntil, Date.now() + delay);
+        await sleep(delay);
+      } else {
+        await sleep(backoffMs(attempt, retryAfter));
+      }
     }
     throw lastError ?? err(`Qloo request failed on ${path}`, 0, path);
   }

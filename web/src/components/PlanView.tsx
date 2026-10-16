@@ -487,7 +487,7 @@ export function PlanView({ plan, roster, onReplan, onEditRoster, busy, disabledR
         ))}
       </div>
 
-      <div role="tabpanel" id="panel-week" aria-labelledby="tab-week" className="tab-panel" hidden={tab !== "week"} tabIndex={0}>
+      <div role="tabpanel" id="panel-week" aria-labelledby="tab-week" className="tab-panel" data-print-title="This week" hidden={tab !== "week"} tabIndex={0}>
         <Fairness plan={plan} />
         <section className="card" aria-labelledby="sum-h">
           <h2 id="sum-h">Summary for the activity coordinator</h2>
@@ -518,11 +518,11 @@ export function PlanView({ plan, roster, onReplan, onEditRoster, busy, disabledR
         )}
       </div>
 
-      <div role="tabpanel" id="panel-residents" aria-labelledby="tab-residents" className="tab-panel" hidden={tab !== "residents"} tabIndex={0}>
+      <div role="tabpanel" id="panel-residents" aria-labelledby="tab-residents" className="tab-panel" data-print-title="Residents" hidden={tab !== "residents"} tabIndex={0}>
         <Residents plan={plan} roster={view} />
       </div>
 
-      <div role="tabpanel" id="panel-families" aria-labelledby="tab-families" className="tab-panel" hidden={tab !== "families"} tabIndex={0}>
+      <div role="tabpanel" id="panel-families" aria-labelledby="tab-families" className="tab-panel" data-print-title="For families" hidden={tab !== "families"} tabIndex={0}>
         <section className="card">
           <div className="card-head">
             <div>
@@ -536,7 +536,7 @@ export function PlanView({ plan, roster, onReplan, onEditRoster, busy, disabledR
       </div>
 
       {mine && (
-        <div role="tabpanel" id="panel-next" aria-labelledby="tab-next" className="tab-panel" hidden={tab !== "next"} tabIndex={0}>
+        <div role="tabpanel" id="panel-next" aria-labelledby="tab-next" className="tab-panel no-print" hidden={tab !== "next"} tabIndex={0}>
           <NextWeek plan={plan} roster={view} onReplan={onReplan} busy={busy} disabledReason={disabledReason} />
         </div>
       )}

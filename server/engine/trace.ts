@@ -50,6 +50,8 @@ export class Tracer {
       return await this.call(tool, input, fn, summarize);
     } catch (e) {
       const status = (e as { status?: unknown })?.status;
+      // QlooError messages are already key-redacted; logged so swallowed failures stay diagnosable.
+      console.warn(`[qloo] ${tool} failed (status ${String(status ?? "n/a")}): ${clip(errMsg(e), 200)}`);
       if (!this.fatal && (status === 401 || status === 403 || status === 429)) this.fatal = e;
       return undefined;
     }
