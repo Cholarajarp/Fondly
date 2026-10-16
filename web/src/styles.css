@@ -279,6 +279,8 @@ input:focus-visible, select:focus-visible, textarea:focus-visible { outline: 3px
 .tl-label { font-weight: 650; font-size: 0.95rem; }
 .tl-fail .tl-label { color: var(--critical-text); }
 .tl-ms { font-family: var(--mono); font-size: 0.75rem; color: var(--faint); white-space: nowrap; }
+.tl-reason { margin: 0.15rem 0 0; font-size: 0.88rem; font-style: italic; color: var(--secondary); word-break: break-word; }
+.agent-run { margin: 0.75rem 0 0; font-size: 0.85rem; color: var(--muted); }
 .tl-summary { display: block; font-size: 0.85rem; color: var(--secondary); margin-top: 0.15rem; word-break: break-word; }
 .tl-foot { margin: 1.25rem 0 0; padding-top: 0.9rem; border-top: 1px solid var(--border); font-size: 0.85rem; color: var(--muted); }
 

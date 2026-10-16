@@ -34,6 +34,7 @@ import {
   BASELINE_TAKE,
   GROUP_TAKE,
   ONE_TO_ONE_TAKE,
+  OUTING_TAKE,
   RELATED_TAKE,
   SCORE_TAKE,
   baselineParams,
@@ -106,6 +107,14 @@ export interface PipelineState {
   writtenFor: Map<string, string>;
   summary: string | null;
   newsletter: string | null;
+  /** Session types whose group pool was fetched, with the pool size used. */
+  fetched: Map<Domain, number>;
+  /** Agent revisions (revise_plan). Pins never bypass availability, opt-outs or declines. */
+  pins: Map<string, string>;
+  /** Candidate ids the agent removed from the whole week. */
+  weekBans: Set<string>;
+  /** slotId -> candidate ids the agent removed from that slot. */
+  slotBans: Map<string, Set<string>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -156,10 +165,14 @@ export function createState(
     writtenFor: new Map(),
     summary: null,
     newsletter: null,
+    fetched: new Map(),
+    pins: new Map(),
+    weekBans: new Set(),
+    slotBans: new Map(),
   };
 }
 
-const domainsInWeek = (state: PipelineState): Set<Domain> => new Set(state.request.slots.map((s) => s.domain));
+export const domainsInWeek = (state: PipelineState): Set<Domain> => new Set(state.request.slots.map((s) => s.domain));
 
 /** Scorable residents who can attend at least one slot. */
 export function scoredResidents(state: PipelineState): string[] {
@@ -339,12 +352,31 @@ function crossSignals(state: PipelineState): string[] {
   return [...counts.entries()].sort((a, b) => b[1] - a[1]).map(([id]) => id);
 }
 
-export async function buildCandidates(state: PipelineState, qloo: QlooClient, tracer: Tracer): Promise<string> {
-  const domains = [...domainsInWeek(state)];
-  const lines: string[] = [];
+/** Bounds for agent-chosen pool sizes (Qloo budget and optimizer time). */
+export const POOL_TAKE_MIN = 5;
+export const POOL_TAKE_MAX = 40;
+
+export interface CandidateOptions {
+  /** Session types to fetch (default: every type in the week). Types already fetched at this size or larger are skipped. */
+  domains?: Domain[];
+  /** Pool size per session type (default GROUP_TAKE, OUTING_TAKE for outings). */
+  take?: number;
+}
+
+/** Session types in the week whose group pool has not been fetched yet. */
+export const unfetchedDomains = (state: PipelineState): Domain[] => [...domainsInWeek(state)].filter((d) => !state.fetched.has(d));
+
+export async function buildCandidates(state: PipelineState, qloo: QlooClient, tracer: Tracer, opts: CandidateOptions = {}): Promise<string> {
+  const week = domainsInWeek(state);
+  const asked = opts.domains?.length ? [...new Set(opts.domains)] : [...week];
+  const notInWeek = asked.filter((d) => !week.has(d));
+  const take = (d: Domain) => Math.max(POOL_TAKE_MIN, Math.min(POOL_TAKE_MAX, opts.take ?? (d === "outing" ? OUTING_TAKE : GROUP_TAKE)));
+  const domains = asked.filter((d) => week.has(d) && (state.fetched.get(d) ?? -1) < take(d));
+  const skipped = asked.filter((d) => week.has(d) && !domains.includes(d));
   await mapLimit(domains, CONCURRENCY, async (domain) => {
+    state.fetched.set(domain, take(domain));
     if (domain === "outing") {
-      lines.push(await outingCandidates(state, qloo, tracer));
+      await outingCandidates(state, qloo, tracer, take(domain));
       return;
     }
     // Same-domain signals when we have them, otherwise cross-domain taste (e.g. music fans -> films).
@@ -357,19 +389,23 @@ export async function buildCandidates(state: PipelineState, qloo: QlooClient, tr
     const exclude = [...state.exclude];
     const res = await tracer.tryCall(
       "get_recommendations",
-      { domain, signals: signals.length, take: GROUP_TAKE },
-      () => counted(state, qloo.insights(recommendParams(domain, signals, { exclude, city: state.request.homeCity }))),
+      { domain, signals: signals.length, take: take(domain) },
+      () => counted(state, qloo.insights(recommendParams(domain, signals, { take: take(domain), exclude, city: state.request.homeCity }))),
       (r) => `${r.length} ${domain} candidates${r[0] ? `, top: ${r[0].name}` : ""}`,
     );
     for (const e of res ?? []) if (suitableForGroup(e)) addCandidate(state, e, domain, "group");
-    lines.push(`${domain}: ${res?.length ?? 0}`);
   });
   const pool = [...state.candidates.values()];
-  const byDomain = domains.map((d) => `${d} ${pool.filter((c) => c.domain === d).length}`).join(", ");
-  return `Candidate pool: ${byDomain}`;
+  const byDomain = [...week].map((d) => `${d} ${pool.filter((c) => c.domain === d).length}`).join(", ");
+  const extra = [
+    skipped.length ? `already fetched: ${skipped.join(", ")}` : "",
+    notInWeek.length ? `not in this week: ${notInWeek.join(", ")}` : "",
+    unfetchedDomains(state).length ? `still unfetched: ${unfetchedDomains(state).join(", ")}` : "",
+  ].filter(Boolean);
+  return `Candidate pool: ${byDomain}${extra.length ? ` (${extra.join("; ")})` : ""}`;
 }
 
-async function outingCandidates(state: PipelineState, qloo: QlooClient, tracer: Tracer): Promise<string> {
+async function outingCandidates(state: PipelineState, qloo: QlooClient, tracer: Tracer, take = OUTING_TAKE): Promise<string> {
   const signals = crossSignals(state);
   const tags = [...new Set([...state.residents.values()].flatMap((r) => r.foodTags))];
   if (!signals.length && !tags.length) {
@@ -378,8 +414,8 @@ async function outingCandidates(state: PipelineState, qloo: QlooClient, tracer: 
   }
   const res = await tracer.tryCall(
     "get_outing_venues",
-    { city: state.request.homeCity, signals: signals.length, tags: tags.length },
-    () => counted(state, qloo.insights(outingParams(state.request.homeCity, signals, tags))),
+    { city: state.request.homeCity, signals: signals.length, tags: tags.length, take },
+    () => counted(state, qloo.insights({ ...outingParams(state.request.homeCity, signals, tags), take })),
     (r) => `${r.length} venues in ${state.request.homeCity}${r[0] ? `, top: ${r[0].name}` : ""}`,
   );
   if (!res?.length) state.notes.push(`Qloo returned no outing venues for ${state.request.homeCity}.`);
@@ -397,7 +433,9 @@ export async function expandForResidents(
   tracer: Tracer,
   residentIds: string[],
   domain: Domain,
+  take = 15,
 ): Promise<string> {
+  take = Math.max(POOL_TAKE_MIN, Math.min(POOL_TAKE_MAX, take));
   const ids = residentIds.filter((id) => state.residents.get(id)?.scorable);
   if (!ids.length) return "No scorable residents in that list.";
   if (!domainsInWeek(state).has(domain)) return `This week has no ${domain} sessions.`;
@@ -407,8 +445,8 @@ export async function expandForResidents(
     const tags = [...new Set(rs.flatMap((r) => r.foodTags))];
     const res = await tracer.tryCall(
       "get_outing_venues",
-      { city: state.request.homeCity, residents: ids.length },
-      () => counted(state, qloo.insights(outingParams(state.request.homeCity, sig, tags))),
+      { city: state.request.homeCity, residents: ids.length, take },
+      () => counted(state, qloo.insights({ ...outingParams(state.request.homeCity, sig, tags), take })),
       (r) => `${r.length} venues`,
     );
     let added = 0;
@@ -426,8 +464,8 @@ export async function expandForResidents(
   const exclude = [...new Set([...state.exclude, ...state.candidates.keys()])].slice(0, 50);
   const res = await tracer.tryCall(
     "get_recommendations",
-    { domain, residents: ids, signals: signals.length, take: 15 },
-    () => counted(state, qloo.insights(recommendParams(domain, signals, { take: 15, exclude, city: state.request.homeCity }))),
+    { domain, residents: ids, signals: signals.length, take },
+    () => counted(state, qloo.insights(recommendParams(domain, signals, { take, exclude, city: state.request.homeCity }))),
     (r) => `${r.length} ${domain} candidates for ${ids.join(", ")}`,
   );
   let added = 0;
@@ -659,15 +697,200 @@ function baselineMetrics(state: PipelineState) {
 export function runOptimizer(state: PipelineState): { metrics: Metrics; unreached: string[] } {
   const residents = scoredResidents(state);
   const candidates = engineCandidates(state);
-  const input = { slots: state.slots, candidates, residents, locked: state.locked, exclude: state.exclude };
+  // Agent pins act like locks (edit-mode locks win); agent week bans act like exclusions.
+  const locked = new Map([...state.pins, ...state.locked]);
+  const exclude = new Set([...state.exclude, ...state.weekBans]);
+  const input = { slots: state.slots, candidates, residents, locked, exclude, slotBans: state.slotBans };
   // Seeding with the baselines guarantees the result is never worse than a baseline on the same pool.
+  // The current schedule wins ties, so re-runs keep picks (and the briefs written for them) unless the
+  // objective improves.
   const seeds = [...state.baselineAssignments.values()];
-  if (state.assignment) seeds.push(state.assignment);
-  const res = optimizeBest(input, seeds);
+  const res = optimizeBest(input, seeds, state.assignment ?? undefined);
   state.assignment = res.bySlot;
   state.metrics = metricsWithDiscovery(state, res.bySlot);
   state.optimizerRuns++;
   return { metrics: state.metrics, unreached: unreached(res, input) };
+}
+
+// ---------------------------------------------------------------------------
+// Step 5b: self-critique (inspect) and agent revisions
+// ---------------------------------------------------------------------------
+
+/** Fit below this for every attendee marks a slot as weak. */
+const LOW_SLOT_FIT = 0.5;
+const normTitle = (s: string) =>
+  s
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[̀-ͯ]/g, "")
+    .replace(/\(.*?\)/g, " ")
+    .replace(/^the\s+/, "")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+
+/**
+ * Compact diagnostics of the current schedule for the agent's self-critique. Every number comes
+ * from Qloo fits and the optimizer; candidate ids are the only handles revise_plan accepts.
+ */
+export function inspectPlan(state: PipelineState) {
+  if (!state.assignment || !state.metrics) throw new Error("Run the optimizer first.");
+  const assignment = state.assignment;
+  const cands = engineCandidates(state);
+  const candMap = new Map(cands.map((c) => [c.id, c]));
+  const residents = scoredResidents(state);
+  const slotReq = new Map(state.request.slots.map((s) => [s.id, s]));
+  const used = new Set(assignment.values());
+  const blockedWeek = new Set([...state.exclude, ...state.weekBans]);
+
+  const best = residents
+    .map((r) => ({ resident: r, ...bestFor(r, assignment, state.slots, candMap) }))
+    .sort((a, b) => a.fit - b.fit);
+  // For the weakest residents: unused pool items they would love, and which slots could take them.
+  const weakest = best.slice(0, 5).map((b) => {
+    const options = cands
+      .filter((c) => !used.has(c.id) && !blockedWeek.has(c.id) && fitOf(c, b.resident) >= REACH_THRESHOLD)
+      .map((c) => ({
+        c,
+        fit: fitOf(c, b.resident),
+        slots: state.slots
+          .filter((s) => s.domain === c.domain && s.attendees.includes(b.resident) && !state.locked.has(s.id) && !state.slotBans.get(s.id)?.has(c.id))
+          .map((s) => s.id),
+      }))
+      .filter((o) => o.slots.length)
+      .sort((x, y) => y.fit - x.fit)
+      .slice(0, 3)
+      .map((o) => ({ candidate_id: o.c.id, name: clip(state.names.get(o.c.id) ?? o.c.id, 60), type: o.c.domain, fit: o.fit, fits_slots: o.slots }));
+    return { resident: b.resident, best_fit: b.fit, best_slot: b.slotId ?? null, unused_strong_options: options };
+  });
+
+  const slots = state.slots.map((s) => {
+    const cid = assignment.get(s.id);
+    const ec = cid ? candMap.get(cid) : undefined;
+    const fits = ec ? s.attendees.filter((r) => residents.includes(r)).map((r) => fitOf(ec, r)) : [];
+    const mean = fits.length ? round3(fits.reduce((a, b) => a + b, 0) / fits.length) : 0;
+    return {
+      slot: s.id,
+      type: s.domain,
+      candidate_id: cid ?? null,
+      pick: cid ? clip(state.names.get(cid) ?? cid, 60) : null,
+      strong_matches: fits.filter((f) => f >= REACH_THRESHOLD - 1e-9).length,
+      mean_fit: mean,
+      max_fit: fits.length ? Math.max(...fits) : 0,
+      pinned: state.pins.has(s.id) || state.locked.has(s.id),
+    };
+  });
+  const lowFit = slots.filter((s) => !s.pick || s.strong_matches === 0 || s.max_fit < LOW_SLOT_FIT).map((s) => s.slot);
+
+  // Near-duplicates: titles that normalize to the same words, or one contains the other.
+  const picked = slots.filter((s) => s.candidate_id).map((s) => ({ slot: s.slot, n: normTitle(state.names.get(s.candidate_id!) ?? "") }));
+  const duplicates: string[][] = [];
+  for (let i = 0; i < picked.length; i++) {
+    for (let j = i + 1; j < picked.length; j++) {
+      const a = picked[i]!.n;
+      const b = picked[j]!.n;
+      if (a && b && (a === b || (Math.min(a.length, b.length) >= 4 && (a.includes(b) || b.includes(a))))) duplicates.push([picked[i]!.slot, picked[j]!.slot]);
+    }
+  }
+  // Over-representation: one origin dominating (e.g. half the week is residents' own favorites), or
+  // one session type taking more than half the week.
+  const bySource = new Map<string, number>();
+  const byType = new Map<string, number>();
+  for (const cid of assignment.values()) {
+    const c = state.candidates.get(cid);
+    if (!c) continue;
+    bySource.set(c.source, (bySource.get(c.source) ?? 0) + 1);
+    byType.set(c.domain, (byType.get(c.domain) ?? 0) + 1);
+  }
+  const half = Math.max(2, Math.ceil(assignment.size / 2));
+  const overRepresented = [
+    ...[...byType.entries()].filter(([, n]) => n > half).map(([t, n]) => `type ${t}: ${n} of ${assignment.size} sessions`),
+    ...[...bySource.entries()].filter(([, n]) => n > half).map(([s, n]) => `source ${s}: ${n} of ${assignment.size} sessions`),
+  ];
+
+  const baselines = baselineMetrics(state)
+    .filter((b) => b.metrics)
+    .map((b) => ({ key: b.key, reached: b.metrics!.reached, min_fit: b.metrics!.minBest, reach_gain: state.metrics!.reached - b.metrics!.reached }));
+
+  return {
+    metrics: state.metrics,
+    resident_best_fit: Object.fromEntries(best.map((b) => [b.resident, b.fit])),
+    weakest,
+    low_fit_slots: lowFit,
+    slots,
+    near_duplicates: duplicates,
+    over_represented: overRepresented,
+    unfetched_types: unfetchedDomains(state),
+    baselines,
+    revisions: { pins: Object.fromEntries(state.pins), week_excluded: [...state.weekBans], slot_excluded: Object.fromEntries([...state.slotBans].map(([k, v]) => [k, [...v]])) },
+  };
+}
+
+const round3 = (n: number) => Math.round(n * 1000) / 1000;
+
+export interface Revision {
+  exclude?: { candidate_id: string; slot_id?: string | null }[];
+  pin?: { slot_id: string; candidate_id: string }[];
+  unpin?: string[];
+}
+
+/**
+ * Applies an agent revision and re-runs the optimizer. Only candidates Qloo returned (already in the
+ * pool) can be referenced; attendance, opt-outs, declines and edit-mode locks stay enforced by the
+ * optimizer. Validates everything before changing state, so a rejected revision changes nothing.
+ */
+export function revisePlan(state: PipelineState, rev: Revision): { before: Metrics; metrics: Metrics; unreached: string[]; changed: string[] } {
+  if (!state.assignment || !state.metrics) throw new Error("Run the optimizer first.");
+  const slotById = new Map(state.slots.map((s) => [s.id, s]));
+  const problems: string[] = [];
+  const known = (id: string) => state.candidates.has(id);
+  for (const x of rev.exclude ?? []) {
+    if (!known(x.candidate_id)) problems.push(`${x.candidate_id} is not in the candidate pool`);
+    if (x.slot_id && !slotById.has(x.slot_id)) problems.push(`slot ${x.slot_id} does not exist`);
+    const lockedHere = [...state.locked.entries()].some(([s, c]) => c === x.candidate_id && (!x.slot_id || s === x.slot_id));
+    if (lockedHere) problems.push(`${x.candidate_id} is kept by the coordinator and cannot be excluded`);
+  }
+  const pinIds = new Set<string>();
+  for (const p of rev.pin ?? []) {
+    const slot = slotById.get(p.slot_id);
+    const c = state.candidates.get(p.candidate_id);
+    if (!slot) problems.push(`slot ${p.slot_id} does not exist`);
+    if (!c) problems.push(`${p.candidate_id} is not in the candidate pool`);
+    if (!slot || !c) continue;
+    if (c.domain !== slot.domain) problems.push(`${p.candidate_id} is ${c.domain}, slot ${p.slot_id} is ${slot.domain}`);
+    if (state.locked.has(p.slot_id)) problems.push(`slot ${p.slot_id} is kept by the coordinator`);
+    if (state.exclude.has(p.candidate_id)) problems.push(`${p.candidate_id} was shown last week and is excluded`);
+    const excludedNow = (rev.exclude ?? []).some((x) => x.candidate_id === p.candidate_id && (!x.slot_id || x.slot_id === p.slot_id));
+    if (state.weekBans.has(p.candidate_id) || state.slotBans.get(p.slot_id)?.has(p.candidate_id) || excludedNow) problems.push(`${p.candidate_id} is excluded from ${p.slot_id}`);
+    if (pinIds.has(p.candidate_id)) problems.push(`${p.candidate_id} is pinned twice`);
+    pinIds.add(p.candidate_id);
+  }
+  const pinSlots = (rev.pin ?? []).map((p) => p.slot_id);
+  if (new Set(pinSlots).size !== pinSlots.length) problems.push("a slot is pinned twice");
+  if (problems.length) throw new Error(`Revision rejected, nothing changed: ${[...new Set(problems)].join("; ")}.`);
+
+  const before = state.metrics;
+  const prev = new Map(state.assignment);
+  for (const s of rev.unpin ?? []) state.pins.delete(s);
+  for (const x of rev.exclude ?? []) {
+    if (x.slot_id) {
+      const set = state.slotBans.get(x.slot_id) ?? new Set<string>();
+      set.add(x.candidate_id);
+      state.slotBans.set(x.slot_id, set);
+      if (state.pins.get(x.slot_id) === x.candidate_id) state.pins.delete(x.slot_id);
+    } else {
+      state.weekBans.add(x.candidate_id);
+      for (const [s, c] of state.pins) if (c === x.candidate_id) state.pins.delete(s);
+    }
+  }
+  for (const p of rev.pin ?? []) {
+    // A candidate can only be in one slot: move an earlier pin of it.
+    for (const [s, c] of state.pins) if (c === p.candidate_id) state.pins.delete(s);
+    state.pins.set(p.slot_id, p.candidate_id);
+  }
+  // The old assignment still seeds the search; the optimizer drops seeded picks that are now banned.
+  const { metrics, unreached } = runOptimizer(state);
+  const changed = state.slots.filter((s) => prev.get(s.id) !== state.assignment!.get(s.id)).map((s) => s.id);
+  return { before, metrics, unreached, changed };
 }
 
 // ---------------------------------------------------------------------------
@@ -768,6 +991,7 @@ export function snapshot(state: PipelineState) {
         when: `${slotReq.get(s.id)?.day} ${slotReq.get(s.id)?.time}`,
         type: s.domain,
         pick: c ? clip(c.entity.name, 60) : null,
+        candidate_id: cid ?? null,
         attendees: s.attendees.length,
         strong_matches: matches,
       };
@@ -777,6 +1001,7 @@ export function snapshot(state: PipelineState) {
       : [],
     unscorable: [...state.residents.values()].filter((r) => !r.scorable).map((r) => r.id),
     pool: Object.fromEntries([...domainsInWeek(state)].map((d) => [d, cands.filter((c) => c.domain === d).length])),
+    unfetched_types: unfetchedDomains(state),
     baselines: baselineMetrics(state).map((b) => ({ key: b.key, metrics: b.metrics ?? null })),
   };
 }

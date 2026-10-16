@@ -14,6 +14,7 @@ import {
   FAVORITE_KINDS,
   TIMES,
   type AgentEvent,
+  type AgentRunAccount,
   type PlanRequest,
   type QlooClient,
   type WeekPlan,
@@ -30,13 +31,14 @@ import {
   runOptimizer,
   scoreAll,
   snapshot,
+  unfetchedDomains,
   type PipelineState,
   type KnownEntity,
 } from "../engine/pipeline.ts";
 import { Tracer, clip, errMsg, safeReason } from "../engine/trace.ts";
 import { AgentError, generateJson, generateWithRetry, modelConfig, type GeminiClient } from "./gemini.ts";
 import { LLM_BASELINE_PROMPT, SYSTEM_PROMPT } from "./prompt.ts";
-import { TOOL_DEFINITIONS, executeTool, type ToolCtx } from "./tools.ts";
+import { PLAN_STEPS, TOOL_DEFINITIONS, createToolCtx, executeTool, toolReason, type PlanStep, type ToolCtx } from "./tools.ts";
 
 export type { GeminiClient } from "./gemini.ts";
 export { AgentError } from "./gemini.ts";
@@ -129,14 +131,13 @@ export async function runFondlyAgent(req: PlanRequest, deps: RunDeps): Promise<W
   const deadline = Date.now() + BUDGET_MS;
   const tracer = new Tracer(deps.emit);
   const state = createState(request, { exclude: deps.exclude, locked: deps.locked, known: deps.known });
-  const ctx: ToolCtx = {
+  const ctx = createToolCtx({
     qloo: deps.qloo,
     state,
     tracer,
-    done: new Set(),
-    finished: false,
+    deadline,
     onMetrics: (label) => state.metrics && deps.emit({ kind: "progress", label, metrics: state.metrics }),
-  };
+  });
   const checkAbort = () => {
     if (deps.signal?.aborted) throw new AgentError("Request was cancelled");
   };
@@ -153,6 +154,7 @@ export async function runFondlyAgent(req: PlanRequest, deps: RunDeps): Promise<W
   } catch (err) {
     if (err instanceof AgentError && /API key|rejected/.test(err.message)) throw err;
     if (deps.signal?.aborted) throw new AgentError("Request was cancelled");
+    safeReason(err, "agent-loop"); // logs the underlying error server-side only
     deps.emit({ kind: "status", message: `${reasonOf(err)}; finishing the plan from Qloo data` });
   }
   checkAbort();
@@ -167,6 +169,7 @@ export async function runFondlyAgent(req: PlanRequest, deps: RunDeps): Promise<W
   await ensureComplete(ctx, deps.emit);
   checkAbort();
   const plan = buildPlan(state, (deps.now ?? (() => new Date()))());
+  plan.agentRun = accountRun(ctx);
   return plan;
 }
 
@@ -265,7 +268,10 @@ async function agentLoop(ctx: ToolCtx, deps: RunDeps, deadline: number): Promise
     for (const [i, c] of calls.entries()) {
       const id = c.id ?? `g${turn}_${i + 1}`;
       const t0 = Date.now();
-      deps.emit({ kind: "tool_call", id, tool: c.name!, input: c.args ?? {} });
+      // The reason is shown as its own line in the timeline, so it is not repeated in the input.
+      const { reason: _r, ...shown } = (c.args ?? {}) as Record<string, unknown>;
+      const reason = toolReason(c.args);
+      deps.emit({ kind: "tool_call", id, tool: c.name!, input: shown, ...(reason ? { reason } : {}) });
       const out = await executeTool(c.name!, c.args ?? {}, ctx);
       deps.emit({ kind: "tool_result", id, tool: c.name!, ok: !out.isError, summary: out.summary, ms: Date.now() - t0 });
       userParts.push({
@@ -279,9 +285,10 @@ async function agentLoop(ctx: ToolCtx, deps: RunDeps, deadline: number): Promise
     } else if (calls.length === 0) {
       if (nudged) return;
       nudged = true;
-      userParts.push({ text: "Continue with the call plan; call finish when done." });
+      userParts.push({ text: "Continue working toward the goals with tool calls; call finish when the plan is as good as you can make it." });
     }
     if (MAX_TURNS - turn <= 3 || deadline - Date.now() < 40_000) {
+      ctx.wrapUp = true;
       userParts.push({ text: "Budget almost used: record_sessions and finish in your next turn." });
     }
     contents.push({ role: "user", parts: userParts });
@@ -356,13 +363,28 @@ export async function ensureComplete(ctx: ToolCtx, emit: (e: AgentEvent) => void
       state.notes.push(`${name} failed: ${safeReason(e, name)}.`);
     }
   };
-  if (!ctx.done.has("resolve_favorites")) await step("Matching favorites on Qloo", () => resolveResidents(state, qloo, tracer));
-  if (!ctx.done.has("build_candidates")) await step("Building the candidate pool", () => buildCandidates(state, qloo, tracer));
-  if (!ctx.done.has("build_baseline")) await step("Building the popular-titles comparison calendar", () => buildPopularBaseline(state, qloo, tracer));
+  // Each step the safety net performs is recorded, so the plan can say honestly who did what.
+  const fill = (s: PlanStep) => ctx.fallback.includes(s) || ctx.fallback.push(s);
+  if (!ctx.done.has("resolve_favorites")) {
+    fill("resolve_favorites");
+    await step("Matching favorites on Qloo", () => resolveResidents(state, qloo, tracer));
+  }
+  // Also covers session types the agent chose not to fetch.
+  const missingPools = state.residents.size ? unfetchedDomains(state) : [];
+  if (!ctx.done.has("build_candidates") || missingPools.length) {
+    fill("build_candidates");
+    await step("Building the candidate pool", () => buildCandidates(state, qloo, tracer, { domains: missingPools.length ? missingPools : undefined }));
+  }
+  if (!ctx.done.has("build_baseline")) {
+    fill("build_baseline");
+    await step("Building the popular-titles comparison calendar", () => buildPopularBaseline(state, qloo, tracer));
+  }
+  if (!ctx.done.has("score_residents")) fill("score_residents");
   // Always score every pair (cheap when already done) and re-optimize: baselines may have added candidates.
   await step("Scoring residents", () => scoreAll(state, qloo, tracer));
   if (state.candidates.size === 0 && tracer.fatal) throw tracer.fatal;
   if (state.candidates.size === 0) throw new AgentError("Qloo returned no candidates for this roster. Check that the favorites are specific titles or artists.");
+  if (!ctx.done.has("optimize")) fill("optimize");
   const before = state.metrics;
   runOptimizer(state);
   if (!before || before.reached !== state.metrics!.reached || before.minBest !== state.metrics!.minBest) {
@@ -371,12 +393,36 @@ export async function ensureComplete(ctx: ToolCtx, emit: (e: AgentEvent) => void
   await step("Fetching related titles", () => fetchRelated(state, qloo, tracer));
   const snap = snapshot(state);
   const needOneToOne = snap.unreached.filter((id) => !state.oneToOne.has(id));
-  if (needOneToOne.length) await step("Planning 1:1 visits", () => buildOneToOnes(state, qloo, tracer, needOneToOne));
+  if (needOneToOne.length) {
+    fill("plan_one_to_ones");
+    await step("Planning 1:1 visits", () => buildOneToOnes(state, qloo, tracer, needOneToOne));
+  }
   // Titles/briefs for slots whose pick changed after the agent wrote them fall back to templates
   // (buildPlan checks writtenFor). The summary quotes metrics, so drop it if the numbers moved.
+  if ([...state.assignment!].some(([sid, cid]) => state.writtenFor.get(sid) !== cid)) fill("record_sessions");
   if (ctx.state.summary && before && (before.reached !== state.metrics!.reached || before.minBest !== state.metrics!.minBest)) {
     state.summary = null;
   }
+  if (!ctx.finished || !state.summary || !state.newsletter) fill("finish");
+}
+
+/**
+ * Who performed each plan step. "both" means the agent ran it but the safety net had to complete it
+ * (e.g. pools for session types the agent skipped, or briefs for picks that changed afterwards).
+ * Steps that were never needed (e.g. 1:1s when everyone is reached) are left out.
+ */
+export function accountRun(ctx: ToolCtx): AgentRunAccount {
+  const steps = PLAN_STEPS.filter((s) => ctx.done.has(s) || ctx.fallback.includes(s)).map((s) => ({
+    step: s,
+    by: !ctx.fallback.includes(s) ? ("agent" as const) : ctx.done.has(s) ? ("both" as const) : ("safety_net" as const),
+  }));
+  return {
+    steps,
+    toolCalls: ctx.toolCalls,
+    expansions: ctx.expansions,
+    revisions: ctx.revisions,
+    ...(ctx.selfEvaluation ? { selfEvaluation: ctx.selfEvaluation } : {}),
+  };
 }
 
 /** Exposed for routes that need to know what the agent sees. */

@@ -10,6 +10,37 @@ const order = (s: { day: string; time: string }) => DAYS.indexOf(s.day as never)
 
 type Tab = "week" | "residents" | "families" | "next";
 
+const STEP_LABEL: Record<string, string> = {
+  resolve_favorites: "matching favorites",
+  build_candidates: "candidate pool",
+  score_residents: "scoring",
+  build_baseline: "baseline",
+  optimize: "optimizing",
+  plan_one_to_ones: "1:1 plans",
+  record_sessions: "session briefs",
+  finish: "summary and newsletter",
+};
+
+/** Who did the work: the agent, or the deterministic safety net. Counts come from code, not the model. */
+function AgentRunLine({ plan }: { plan: WeekPlan }) {
+  const run = plan.agentRun;
+  if (!run) return null;
+  const net = run.steps.filter((s) => s.by === "safety_net").map((s) => STEP_LABEL[s.step] ?? s.step);
+  const helped = run.steps.filter((s) => s.by === "both").map((s) => STEP_LABEL[s.step] ?? s.step);
+  const extra = [run.expansions && `${run.expansions} expansion${run.expansions === 1 ? "" : "s"}`, run.revisions && `${run.revisions} revision${run.revisions === 1 ? "" : "s"}`].filter(Boolean);
+  const head = !net.length && !helped.length ? "Agent-driven: all steps" : net.length === run.steps.length ? "Built by the safety net (the agent did not run)" : "Agent-driven, with safety-net help";
+  const parts = [
+    `${run.toolCalls} agent tool call${run.toolCalls === 1 ? "" : "s"}${extra.length ? `, ${extra.join(", ")}` : ""}`,
+    net.length && net.length !== run.steps.length ? `safety net did: ${net.join(", ")}` : "",
+    helped.length ? `safety net completed: ${helped.join(", ")}` : "",
+  ].filter(Boolean);
+  return (
+    <p className="agent-run">
+      {head} ({parts.join("; ")}).
+    </p>
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Fairness panel
 // ---------------------------------------------------------------------------
@@ -50,6 +81,7 @@ function Fairness({ plan }: { plan: WeekPlan }) {
               <div className="d">{plan.qlooRequests} Qloo requests</div>
             </div>
           </div>
+          <AgentRunLine plan={plan} />
           {unscorable > 0 && (
             <p className="hint" style={{ marginTop: "0.75rem" }}>
               {unscorable} resident{unscorable === 1 ? "" : "s"} could not be scored because none of their favorites matched on Qloo. See Residents.

@@ -268,6 +268,25 @@ export interface WeekPlan {
   optimizerRuns: number;
   previousPlanId?: string;
   diff?: PlanDiff;
+  /** Which plan steps the agent performed and which the deterministic safety net filled in. Absent on older plans. */
+  agentRun?: AgentRunAccount;
+}
+
+/** A plan step and who performed it. */
+export interface PlanStepAccount {
+  step: string;
+  /** "both": the agent ran the step and the safety net completed it. */
+  by: "agent" | "safety_net" | "both";
+}
+
+export interface AgentRunAccount {
+  steps: PlanStepAccount[];
+  /** Tool calls the agent made (including rejected ones). */
+  toolCalls: number;
+  expansions: number;
+  revisions: number;
+  /** The agent's own account of what it tried and what is still weak (free text, no numbers shown from it). */
+  selfEvaluation?: { tried: string; remaining: string };
 }
 
 // ---------------------------------------------------------------------------
@@ -276,7 +295,7 @@ export interface WeekPlan {
 
 export type AgentEvent =
   | { kind: "status"; message: string }
-  | { kind: "tool_call"; id: string; tool: string; input: unknown }
+  | { kind: "tool_call"; id: string; tool: string; input: unknown; /** The agent's stated reason (agent tools only), clipped. */ reason?: string }
   | { kind: "tool_result"; id: string; tool: string; ok: boolean; summary: string; ms: number }
   | { kind: "progress"; label: string; metrics: Metrics }
   | { kind: "done"; plan: WeekPlan }
