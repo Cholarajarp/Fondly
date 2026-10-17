@@ -1,5 +1,6 @@
 // Thin Gemini helpers shared by the agent loop and the structured-output calls.
-import { ApiError, ThinkingLevel, type GenerateContentParameters, type GenerateContentResponse, type GoogleGenAI } from "@google/genai";
+import { ApiError, ThinkingLevel, type Content, type GenerateContentParameters, type GenerateContentResponse, type GoogleGenAI } from "@google/genai";
+import { NvidiaError, isNvidiaConfigured, nvidiaGenerate, nvidiaModels } from "./nvidia.ts";
 
 export type GeminiClient = Pick<GoogleGenAI, "models">;
 
@@ -57,8 +58,42 @@ export class AgentError extends Error {
  */
 const STICKY_MS = 10 * 60 * 1000;
 const stickyModel = new Map<string, { model: string; until: number }>();
+/** Until this time, calls go straight to NVIDIA (Gemini recently rate limited or failed). */
+let nvidiaUntil = 0;
+/** Marks a conversation's first content once it has moved to NVIDIA. */
+const ON_NVIDIA = Symbol("onNvidia");
+type Tagged = Content & { [ON_NVIDIA]?: true };
+
 /** Test hook: forget remembered fallbacks. */
-export const resetStickyModels = () => stickyModel.clear();
+export const resetStickyModels = () => {
+  stickyModel.clear();
+  nvidiaUntil = 0;
+};
+
+type RetryOpts = { signal?: AbortSignal; deadline: number; sleep?: (ms: number, s?: AbortSignal) => Promise<void>; onRetry?: (s: number) => void };
+
+/** Tries each NVIDIA model once, within the caller's deadline. */
+async function viaNvidia(params: GenerateContentParameters, opts: RetryOpts, contents: Content[]): Promise<GenerateContentResponse> {
+  if (contents[0]) (contents[0] as Tagged)[ON_NVIDIA] = true;
+  let last: unknown;
+  for (const model of nvidiaModels()) {
+    const remaining = opts.deadline - Date.now();
+    if (remaining <= 500) throw new AgentError("Time budget reached");
+    const signals = [AbortSignal.timeout(Math.min(remaining, 90_000))];
+    if (opts.signal) signals.push(opts.signal);
+    try {
+      return await nvidiaGenerate(model, params, { signal: AbortSignal.any(signals) });
+    } catch (err) {
+      if (opts.signal?.aborted) throw err;
+      if (err instanceof NvidiaError && (err.status === 401 || err.status === 403)) {
+        throw new AgentError("The fallback language model rejected the server's API key. Check NVIDIA_API_KEY.");
+      }
+      console.warn(`[llm] nvidia ${model} failed: ${err instanceof NvidiaError ? err.status : (err as Error)?.name}`);
+      last = err;
+    }
+  }
+  throw last ?? new AgentError("No NVIDIA model available");
+}
 
 export async function generateWithRetry(
   gemini: GeminiClient,
@@ -74,6 +109,13 @@ export async function generateWithRetry(
   if (sticky && sticky.until > Date.now() && fallbacks.includes(sticky.model)) {
     fallbacks.splice(0, fallbacks.indexOf(sticky.model) + 1);
     model = sticky.model;
+  }
+  // A conversation that already failed over stays on NVIDIA: Gemini would reject its history.
+  const contents = Array.isArray(params.contents) ? (params.contents as Content[]) : [];
+  // LLM_PROVIDER=nvidia skips Gemini entirely (e.g. when its daily quota is gone).
+  const forced = process.env.LLM_PROVIDER?.trim().toLowerCase() === "nvidia";
+  if (isNvidiaConfigured() && (forced || nvidiaUntil > Date.now() || contents.some((c) => (c as Tagged)[ON_NVIDIA]))) {
+    return viaNvidia(params, opts, contents);
   }
   for (let attempt = 0; ; attempt++) {
     const remaining = opts.deadline - Date.now();
@@ -101,6 +143,13 @@ export async function generateWithRetry(
         opts.onRetry?.(0);
         attempt--;
         continue;
+      }
+      // Rate limited, overloaded or timed out: NVIDIA answers now instead of after a backoff.
+      const timedOut = (err as Error)?.name === "TimeoutError" || (err as Error)?.name === "AbortError";
+      if (isNvidiaConfigured() && (isRetryable(err) || timedOut) && opts.deadline - Date.now() > 5_000) {
+        console.warn(`[llm] gemini ${model} failed (status=${status ?? (err as Error)?.name}); switching to NVIDIA`);
+        nvidiaUntil = Date.now() + STICKY_MS;
+        return viaNvidia(params, opts, contents);
       }
       const delay = RETRY_DELAYS_MS[attempt];
       if (isRetryable(err) && delay !== undefined && opts.deadline - Date.now() > delay + 10_000) {

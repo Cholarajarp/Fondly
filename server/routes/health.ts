@@ -3,6 +3,7 @@ import { Router } from "express";
 export interface HealthDeps {
   qlooConfigured: () => boolean;
   llmConfigured: () => boolean;
+  llmFallbackConfigured: () => boolean;
   model: string | undefined;
 }
 
@@ -15,6 +16,7 @@ export function createHealthRouter(deps: HealthDeps): Router {
       qloo: deps.qlooConfigured(),
       llm: deps.llmConfigured(),
       model: deps.model ?? null,
+      llmFallback: deps.llmFallbackConfigured(),
     });
   });
   return router;

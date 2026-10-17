@@ -12,6 +12,7 @@ import { createPlansStore, type PlansStore } from "./plans-store.ts";
 import { createInvitesStore, type InvitesStore } from "./invites-store.ts";
 import { createFamilyRouter, type FamilyLimits } from "./routes/family.ts";
 import { createHealthRouter } from "./routes/health.ts";
+import { isNvidiaConfigured } from "./agent/nvidia.ts";
 import { createPlanRouter, type RunAgent } from "./routes/plan.ts";
 import { createKitRouter } from "./routes/kits.ts";
 import { createKitStore, type KitStore } from "./kits/store.ts";
@@ -29,6 +30,7 @@ export interface AppDeps {
   missingKeys?: () => string[];
   qlooConfigured?: () => boolean;
   llmConfigured?: () => boolean;
+  llmFallbackConfigured?: () => boolean;
   model?: string;
   perHourLimit?: number;
   dailyCap?: number;
@@ -101,6 +103,7 @@ export function createApp(deps: AppDeps = {}): Express {
     createHealthRouter({
       qlooConfigured,
       llmConfigured: deps.llmConfigured ?? (() => !missingKeys().includes("GEMINI_API_KEY")),
+      llmFallbackConfigured: deps.llmFallbackConfigured ?? isNvidiaConfigured,
       model: deps.model ?? config.GEMINI_MODEL,
     }),
   );

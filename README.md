@@ -81,6 +81,8 @@ Both keys are required. There is no mock mode: without keys the server boots and
 
 Optional settings: `GEMINI_FALLBACK_MODELS` lists models tried in order when `GEMINI_MODEL` is overloaded (5xx) or unavailable (404). It defaults to `gemini-3.5-flash,gemini-3-flash-preview`; set it to `none` to turn fallback off. `PUBLIC_RATE_LIMIT_PER_HOUR` (20) and `DAILY_PLAN_CAP` (200) set the demo limits. All variables are listed in `.env.example`.
 
+LLM fallback: set `NVIDIA_API_KEY` (free at build.nvidia.com) and any Gemini call that is rate limited (429), overloaded or timed out switches straight to NVIDIA Nemotron (`nvidia/nemotron-3.5-super-vl-120b-a12b`, then `nvidia/nemotron-3-super-120b-a12b`) through the OpenAI-compatible API, and stays there for 10 minutes. A run that switches keeps its tool-calling history. `NVIDIA_MODELS` overrides the list; `LLM_PROVIDER=nvidia` skips Gemini entirely. `/api/health` reports `llmFallback`.
+
 ### Roster backup
 
 Resident names live only in this browser's localStorage, so clearing site data or switching devices loses the roster. Use **Export backup (JSON)** under the resident list to save everything (home details, residents and the week), or **Export residents (CSV)** for a spreadsheet with one row per resident (favorites per kind and lists separated by `;`). **Import from file…** accepts either format, validates it with the same limits the planner uses, and asks whether to replace the roster or merge by name. Files contain names, so keep them private.
