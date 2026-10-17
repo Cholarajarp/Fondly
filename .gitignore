@@ -1,10 +1,32 @@
+# Dependencies and build output
 node_modules/
 dist/
+coverage/
+
+# Secrets (keep the template)
 .env
 .env.*
 !.env.example
+
+# Local runtime data (Qloo cache, plans, kits, invites)
 .cache/
+
+# Logs and temp files
 *.log
+*.tmp
+
+# Local tooling and notes, not part of the project
+.claude/
 .remember/
 .playwright-mcp/
 .shots/
+HANDOFF.md
+
+# Tests stay local
+tests/
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

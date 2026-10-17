@@ -4,13 +4,18 @@ import { ApiError, ThinkingLevel, type GenerateContentParameters, type GenerateC
 export type GeminiClient = Pick<GoogleGenAI, "models">;
 
 export const DEFAULT_GEMINI_MODEL = "gemini-3.1-flash-lite";
-/** Used after the primary model reports overload (5xx): capacity is per model, so retrying elsewhere recovers. */
-export const DEFAULT_FALLBACK_MODEL = "gemini-2.5-flash";
+/**
+ * Tried in order after the primary model reports overload (5xx) or is unavailable (404): capacity is
+ * per model, so moving to another model recovers. All Gemini 3, so thinking config and thought
+ * signatures stay valid. GEMINI_FALLBACK_MODELS overrides (comma-separated, "none" disables).
+ */
+export const DEFAULT_FALLBACK_MODELS = ["gemini-3.5-flash", "gemini-3-flash-preview"];
 
-export function fallbackModel(): string | undefined {
-  const raw = process.env.GEMINI_FALLBACK_MODEL?.trim();
-  if (raw === "none") return undefined;
-  return raw || DEFAULT_FALLBACK_MODEL;
+export function fallbackModels(primary: string): string[] {
+  const raw = process.env.GEMINI_FALLBACK_MODELS?.trim();
+  if (raw === "none") return [];
+  const list = raw ? raw.split(",").map((m) => m.trim()).filter(Boolean) : DEFAULT_FALLBACK_MODELS;
+  return list.filter((m) => m !== primary);
 }
 
 const THINKING_LEVELS: Record<string, ThinkingLevel> = {
@@ -50,38 +55,51 @@ export class AgentError extends Error {
  * One generateContent call with bounded retries. Throws AgentError for configuration errors
  * and the last error for anything else.
  */
+const STICKY_MS = 10 * 60 * 1000;
+const stickyModel = new Map<string, { model: string; until: number }>();
+/** Test hook: forget remembered fallbacks. */
+export const resetStickyModels = () => stickyModel.clear();
+
 export async function generateWithRetry(
   gemini: GeminiClient,
   params: GenerateContentParameters,
   opts: { signal?: AbortSignal; deadline: number; sleep?: (ms: number, s?: AbortSignal) => Promise<void>; onRetry?: (s: number) => void },
 ): Promise<GenerateContentResponse> {
   const sleep = opts.sleep ?? defaultSleep;
-  const fallback = fallbackModel();
+  const fallbacks = fallbackModels(params.model);
+  // If the primary recently failed over, start where the last call succeeded instead of re-probing
+  // a retired or overloaded model on every one of the agent's turns.
   let model = params.model;
+  const sticky = stickyModel.get(params.model);
+  if (sticky && sticky.until > Date.now() && fallbacks.includes(sticky.model)) {
+    fallbacks.splice(0, fallbacks.indexOf(sticky.model) + 1);
+    model = sticky.model;
+  }
   for (let attempt = 0; ; attempt++) {
     const remaining = opts.deadline - Date.now();
     if (remaining <= 500) throw new AgentError("Time budget reached");
     const signals = [AbortSignal.timeout(Math.max(1, remaining))];
     if (opts.signal) signals.push(opts.signal);
     try {
-      return await gemini.models.generateContent({
+      const res = await gemini.models.generateContent({
         ...params,
         model,
         config: {
           ...params.config,
-          // thinkingLevel is Gemini 3 only; older fallback models reject it.
-          ...(model !== params.model && !model.startsWith("gemini-3") ? { thinkingConfig: undefined } : {}),
           abortSignal: AbortSignal.any(signals),
         },
       });
+      if (model !== params.model) stickyModel.set(params.model, { model, until: Date.now() + STICKY_MS });
+      return res;
     } catch (err) {
       if (opts.signal?.aborted) throw err;
       const status = err instanceof ApiError ? err.status : undefined;
       if (status === 401 || status === 403) throw new AgentError("The language model rejected the server's API key. Check GEMINI_API_KEY.");
-      // Overload on the primary model: switch once to the fallback model and retry right away.
-      if ((status === 503 || status === 500) && fallback && model !== fallback) {
-        model = fallback;
+      // Overloaded or unavailable model: move to the next fallback model and retry right away.
+      if ((status === 503 || status === 500 || status === 404) && fallbacks.length) {
+        model = fallbacks.shift()!;
         opts.onRetry?.(0);
+        attempt--;
         continue;
       }
       const delay = RETRY_DELAYS_MS[attempt];

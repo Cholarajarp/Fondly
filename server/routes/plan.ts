@@ -198,7 +198,12 @@ export function createPlanRouter(deps: PlanRouteDeps): Router {
       if (controller.signal.aborted) return;
       if (!isValidPlanId(plan.id)) plan.id = randomUUID();
       decorate(plan);
-      await deps.store.savePlan(plan);
+      // A full disk or write error must not throw away a plan that took minutes to build.
+      try {
+        await deps.store.savePlan(plan);
+      } catch (saveErr) {
+        console.error(`[plan] save failed: ${(saveErr as Error)?.message ?? saveErr}`);
+      }
       emit({ kind: "done", plan });
     } catch (err) {
       if (!controller.signal.aborted) {

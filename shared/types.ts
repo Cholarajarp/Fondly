@@ -59,9 +59,35 @@ export interface HeatmapCell {
   popularity?: number;
 }
 
-export interface AgeAffinity {
-  age: "35_and_younger" | "36_to_55" | "55_and_older";
+/** Age buckets Qloo's demographics insights return (checked live). */
+export type AgeBucket = "24_and_younger" | "25_to_29" | "30_to_34" | "35_to_44" | "45_to_54" | "55_and_older";
+
+/** One entity's age affinities from urn:demographics: -1..1, 0 = average audience. */
+export interface EntityDemographics {
+  entity_id: string;
+  age: Partial<Record<AgeBucket, number>>;
+}
+
+/** Qloo's 55-and-older audience signal for a scheduled pick. */
+export interface OlderAdultSignal {
+  /** Qloo's 55_and_older affinity, -1..1 (0 = average). */
   affinity: number;
+  /** True when the affinity is clearly positive and 55+ is this title's strongest age group ("Loved by 55+"). */
+  loved: boolean;
+}
+
+/** An area near the home where the group's taste clusters (Qloo heatmap). */
+export interface OutingArea {
+  /** Neighborhood name Qloo returns for venues there (geocode), when available. */
+  name: string;
+  lat: number;
+  lon: number;
+  /** Qloo heatmap affinity rank 0..1. */
+  affinity: number;
+  /** Top group-matched venues Qloo returns in the area. */
+  venues: string[];
+  /** One line on why, built from Qloo data. */
+  why: string;
 }
 
 /** Error thrown by the Qloo client. `status` is the HTTP status (0 for network/validation errors). */
@@ -79,10 +105,11 @@ export class QlooError extends Error {
 /** Interface the live Qloo client implements (server/qloo/client.ts). */
 export interface QlooClient {
   searchEntities(query: string, types?: EntityType[], take?: number): Promise<QlooEntity[]>;
-  searchTags(query: string, take?: number): Promise<QlooTag[]>;
+  /** `types` limits results to tag types, e.g. "urn:tag:genre:music" (Qloo's filter.tag.types). */
+  searchTags(query: string, take?: number, types?: string[]): Promise<QlooTag[]>;
   insights(params: Record<string, string | number | boolean>): Promise<QlooEntity[]>;
   heatmap(params: Record<string, string | number | boolean>): Promise<HeatmapCell[]>;
-  demographics(params: Record<string, string | number | boolean>): Promise<AgeAffinity[]>;
+  demographics(params: Record<string, string | number | boolean>): Promise<EntityDemographics[]>;
   /** Number of real HTTP calls made (cache hits excluded). */
   callCount(): number;
 }
@@ -125,7 +152,26 @@ export interface ResidentInput {
   loved?: string[];
   /** Qloo entity ids the resident declined (never scheduled as a match for them). */
   declined?: string[];
+  /** Optional birth year (BIRTH_YEAR_MIN..BIRTH_YEAR_MAX): biases film and TV toward the years of their youth. */
+  birthYear?: number;
 }
+
+/** Accepted birth years. Qloo's release years make the window meaningful for these cohorts. */
+export const BIRTH_YEAR_MIN = 1915;
+export const BIRTH_YEAR_MAX = 1975;
+/**
+ * Reminiscence bump: people respond most to the culture of their teens and twenties.
+ * The youth window is birthYear + YOUTH_FROM_AGE .. birthYear + YOUTH_TO_AGE.
+ */
+export const YOUTH_FROM_AGE = 10;
+export const YOUTH_TO_AGE = 30;
+
+export interface YearRange {
+  from: number;
+  to: number;
+}
+
+export const youthYears = (birthYear: number): YearRange => ({ from: birthYear + YOUTH_FROM_AGE, to: birthYear + YOUTH_TO_AGE });
 
 export interface SlotInput {
   id: string;
@@ -140,6 +186,8 @@ export interface PlanRequest {
   homeName?: string;
   /** City used for outing venues. */
   homeCity: string;
+  /** Typical birth year at the home, used for residents without their own birthYear. Absent: no era bias. */
+  defaultBirthYear?: number;
   residents: ResidentInput[];
   slots: SlotInput[];
 }
@@ -152,7 +200,7 @@ export interface ResolvedFavorite {
   status: ResolveStatus;
   /** Qloo entity (music/film/tv/books). */
   entity?: Pick<QlooEntity, "entity_id" | "name" | "type" | "image_url">;
-  /** Qloo tag (food). */
+  /** Qloo tag: cuisines for food, genres (e.g. "Big Band", "Westerns") for other kinds. */
   tag?: QlooTag;
 }
 
@@ -167,6 +215,8 @@ export interface SessionMatch {
   ownFavorite: boolean;
   /** Plain-language reason built from Qloo explainability. */
   why: string;
+  /** True when the title was released in the resident's youth window (film and TV only). */
+  fromYouth?: boolean;
 }
 
 export interface ScheduledSession {
@@ -187,11 +237,15 @@ export interface ScheduledSession {
   title: string;
   /** Markdown, written by the agent from Qloo data (templated fallback). */
   brief: string;
+  /** Qloo 55+ audience signal for the pick, when Qloo returned one. */
+  olderAdults?: OlderAdultSignal;
 }
 
 export interface OneToOnePlan {
   picks: QlooEntity[];
   note: string;
+  /** Pick entity id -> Qloo 55+ audience signal. */
+  olderAdults?: Record<string, OlderAdultSignal>;
 }
 
 export interface ResidentOutcome {
@@ -202,8 +256,10 @@ export interface ResidentOutcome {
   bestFit: number;
   bestSlotId?: string;
   /** Every scheduled session the resident can attend, with their fit. */
-  sessions: { slotId: string; fit: number; ownFavorite: boolean; why: string }[];
+  sessions: { slotId: string; fit: number; ownFavorite: boolean; why: string; fromYouth?: boolean }[];
   favorites: ResolvedFavorite[];
+  /** Release years of their teens and twenties (from their own or the home's birth year). */
+  youthYears?: YearRange;
   oneToOne?: OneToOnePlan;
   /** Deterministic care-plan note (no LLM text), suitable for activity documentation. */
   careNote: string;
@@ -270,6 +326,8 @@ export interface WeekPlan {
   diff?: PlanDiff;
   /** Which plan steps the agent performed and which the deterministic safety net filled in. Absent on older plans. */
   agentRun?: AgentRunAccount;
+  /** Areas near the home where the group's taste clusters (Qloo heatmap). Absent when unavailable. */
+  outingIdeas?: OutingArea[];
 }
 
 /** A plan step and who performed it. */

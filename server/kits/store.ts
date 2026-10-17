@@ -18,6 +18,21 @@ export function createKitStore(dir: string, opts: { maxAgeMs?: number } = {}): K
   const kitsDir = path.resolve(dir, "kits");
   // Plans are pruned at 90 days; kits follow the same window.
   const maxAgeMs = opts.maxAgeMs ?? 90 * 24 * 60 * 60 * 1000;
+  // Reads ignore stale kits; this removes whole per-plan folders past the window (at most hourly).
+  let lastPrune = 0;
+  const maybePrune = () => {
+    const now = Date.now();
+    if (now - lastPrune < 60 * 60 * 1000) return;
+    lastPrune = now;
+    void (async () => {
+      const names = await fs.readdir(kitsDir).catch(() => [] as string[]);
+      for (const n of names) {
+        const p = path.join(kitsDir, n);
+        const st = await fs.stat(p).catch(() => null);
+        if (st?.isDirectory() && now - st.mtimeMs > maxAgeMs) await fs.rm(p, { recursive: true, force: true }).catch(() => {});
+      }
+    })();
+  };
   const file = (planId: string, slotId: string) => {
     if (!isValidPlanId(planId) || !isValidSlotId(slotId)) throw new Error("Invalid kit id");
     return path.join(kitsDir, planId.toLowerCase(), `${slotId}.json`);
@@ -40,6 +55,7 @@ export function createKitStore(dir: string, opts: { maxAgeMs?: number } = {}): K
     },
     async saveKit(kit) {
       await atomicWriteJson(file(kit.planId, kit.slotId), SessionKitZ.parse(kit));
+      maybePrune();
     },
   };
 }

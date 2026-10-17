@@ -1,5 +1,5 @@
 # Render Blueprint: one web service (Starter plan, no cold starts) with a persistent disk
-# for the private Qloo response cache and saved plans.
+# for the private Qloo response cache, saved plans, session kits and family invites.
 services:
   - type: web
     name: fondly
@@ -26,10 +26,15 @@ services:
         value: gemini-3.1-flash-lite
       - key: GEMINI_THINKING
         value: low
+      # Tried in order if GEMINI_MODEL is overloaded or unavailable; "none" disables fallback.
+      - key: GEMINI_FALLBACK_MODELS
+        value: gemini-3.5-flash,gemini-3-flash-preview
       - key: CACHE_DIR
         value: /var/data/cache
       - key: PUBLIC_RATE_LIMIT_PER_HOUR
         value: "20"
+      - key: DAILY_PLAN_CAP
+        value: "200"
     disk:
       name: fondly-data
       mountPath: /var/data

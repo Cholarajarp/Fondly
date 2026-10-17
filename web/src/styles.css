@@ -126,6 +126,9 @@ main { max-width: var(--max); margin: 0 auto; padding: 2rem var(--pad-x) 5rem; d
 .eyebrow-brand { color: var(--brand-text); }
 .lede { font-size: clamp(1.05rem, 1.6vw, 1.25rem); color: var(--secondary); max-width: 62ch; }
 .hint { color: var(--muted); font-size: 0.92rem; }
+.hint-bad { color: var(--critical-text); }
+input[aria-invalid="true"] { border-color: var(--critical-border); }
+.badge-era { color: var(--brand-text); border-color: var(--sage-border); background: var(--sage-subtle); }
 .mono { font-family: var(--mono); }
 .num { font-variant-numeric: tabular-nums; }
 
@@ -219,7 +222,8 @@ input:focus-visible, select:focus-visible, textarea:focus-visible { outline: 3px
 .toggle { display: inline-flex; align-items: center; min-height: 40px; padding: 0.35rem 0.8rem; border-radius: 999px; border: 1px solid var(--border-strong); background: transparent; cursor: pointer; font-size: 0.9rem; }
 .toggle[aria-pressed="true"] { background: var(--foreground); border-color: var(--foreground); color: var(--background); }
 .add-resident { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 0.5rem; }
-.intake { display: grid; gap: 0.5rem; background: var(--sage-subtle); border: 1px solid var(--sage-border); border-radius: var(--radius-sm); padding: 0.85rem; }
+.roster-backup { margin-top: 1.1rem; padding-top: 0.9rem; border-top: 1px solid var(--border); display: grid; gap: 0.5rem; }
+.roster-backup .hint, .roster-backup .error-msg { margin: 0; }.intake { display: grid; gap: 0.5rem; background: var(--sage-subtle); border: 1px solid var(--sage-border); border-radius: var(--radius-sm); padding: 0.85rem; }
 .intake .label { color: var(--sage); }
 .privacy { display: flex; gap: 0.6rem; align-items: flex-start; font-size: 0.9rem; color: var(--secondary); background: var(--surface-2); border-radius: var(--radius-sm); padding: 0.75rem 0.9rem; margin: 0; }
 .privacy svg { flex: none; width: 18px; height: 18px; margin-top: 0.15rem; color: var(--sage); }
@@ -366,6 +370,9 @@ input:focus-visible, select:focus-visible, textarea:focus-visible { outline: 3px
 .person li { margin-bottom: 0.3rem; }
 .one2one { background: var(--brand-subtle); border-radius: var(--radius-sm); padding: 0.7rem 0.85rem; font-size: 0.92rem; }
 .one2one strong { color: var(--brand-text); }
+.badge-row { display: flex; flex-wrap: wrap; gap: 0.35rem; }
+.one2one .badge { vertical-align: middle; }
+.outing-ideas { margin: 0.5rem 0 0; padding-left: 1.25rem; display: grid; gap: 0.4rem; }
 .care-note { font-size: 0.88rem; color: var(--secondary); background: var(--surface-2); border-radius: var(--radius-sm); padding: 0.65rem 0.8rem; margin: 0; }
 .notices { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.4rem; }
 .notice { font-size: 0.9rem; background: var(--caution-subtle); border: 1px solid var(--caution-border); border-radius: var(--radius-sm); padding: 0.5rem 0.75rem; }

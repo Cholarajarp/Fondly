@@ -136,6 +136,47 @@ function Thumb({ s }: { s: ScheduledSession }) {
   );
 }
 
+/** Qloo audience badge: text label (not color-only), with the source spelled out for screen readers. */
+function Loved55({ affinity }: { affinity: number }) {
+  const label = `Loved by 55+: Qloo's audience data shows this is most popular with people 55 and older (affinity ${affinity.toFixed(2)})`;
+  return (
+    <span className="badge badge-brand" title={label}>
+      <span aria-hidden="true">Loved by 55+</span>
+      <span className="sr-only">{label}</span>
+    </span>
+  );
+}
+
+function OutingIdeas({ plan }: { plan: WeekPlan }) {
+  const areas = plan.outingIdeas ?? [];
+  if (!areas.length) return null;
+  return (
+    <section className="card" aria-labelledby="outing-ideas-h">
+      <h2 id="outing-ideas-h">Outing ideas near {plan.request.homeCity}</h2>
+      <p className="hint">Areas where this group's taste clusters on Qloo's heatmap. Check access and opening times before booking.</p>
+      <ol className="outing-ideas">
+        {areas.map((a) => (
+          <li key={`${a.lat},${a.lon}`}>
+            <strong>{a.name}</strong>
+            <span className="hint"> · {a.why}</span>
+          </li>
+        ))}
+      </ol>
+    </section>
+  );
+}
+
+/** "From their youth": the title came out in strongly matched residents' teens or twenties. */
+function FromYouth({ s }: { s: ScheduledSession }) {
+  const n = s.matches.filter((m) => m.fromYouth).length;
+  if (!n) return null;
+  return (
+    <span className="badge badge-era" title="Released when these residents were in their teens or twenties, the years people tend to remember most">
+      From their youth{n > 1 ? ` · ${n} residents` : ""}
+    </span>
+  );
+}
+
 function SessionCard({ s, roster, onOpenKit }: { s: ScheduledSession; roster: Roster; onOpenKit: (slotId: string) => void }) {
   const strong = s.matches.length;
   return (
@@ -157,10 +198,12 @@ function SessionCard({ s, roster, onOpenKit }: { s: ScheduledSession; roster: Ro
           </div>
         </div>
       </div>
-      <div>
+      <div className="badge-row">
         <span className={`badge ${strong >= 2 ? "badge-sage" : strong === 1 ? "badge-warn" : ""}`}>
           Strong match for {strong} of {s.attendees.length}
         </span>
+        {s.olderAdults?.loved && <Loved55 affinity={s.olderAdults.affinity} />}
+        <FromYouth s={s} />
       </div>
       {strong > 0 && (
         <ul className="who" aria-label="Strongly matched residents">
@@ -244,7 +287,14 @@ function Residents({ plan, roster }: { plan: WeekPlan; roster: Roster }) {
             )}
             {r.oneToOne && (
               <div className="one2one">
-                <strong>1:1 visit idea:</strong> {r.oneToOne.picks.map((p) => p.name).join(", ")}
+                <strong>1:1 visit idea:</strong>{" "}
+                {r.oneToOne.picks.map((p, i) => (
+                  <span key={p.entity_id}>
+                    {i > 0 ? ", " : ""}
+                    {p.name}
+                    {r.oneToOne!.olderAdults?.[p.entity_id]?.loved && <> <Loved55 affinity={r.oneToOne!.olderAdults[p.entity_id]!.affinity} /></>}
+                  </span>
+                ))}
               </div>
             )}
             {r.warnings.length > 0 && (
@@ -573,6 +623,7 @@ export function PlanView({ plan, roster, onReplan, onEditRoster, busy, disabledR
             <SessionCard key={s.slotId} s={s} roster={view} onOpenKit={setKitSlot} />
           ))}
         </div>
+        <OutingIdeas plan={plan} />
         {plan.notes.length > 0 && (
           <section className="card" aria-labelledby="notes-h">
             <h2 id="notes-h">Notes and limits</h2>

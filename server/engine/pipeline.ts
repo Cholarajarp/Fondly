@@ -19,6 +19,8 @@ import {
   type ScheduledSession,
   type SessionMatch,
   type WeekPlan,
+  type YearRange,
+  youthYears,
 } from "../../shared/types.ts";
 import {
   bestFor,
@@ -44,9 +46,12 @@ import {
   rankFits,
   recommendParams,
   resolveEntity,
+  resolveFavorite,
   resolveFoodTag,
   scoreParams,
   suitableForGroup,
+  ERA_DOMAINS,
+  inYears,
 } from "./qloo-ops.ts";
 import { Tracer, clip, errMsg, mapLimit } from "./trace.ts";
 
@@ -61,6 +66,12 @@ export interface ResidentState {
   /** All entity signal ids across domains (cross-domain taste signal). */
   allSignals: string[];
   foodTags: string[];
+  /** Genre tag ids per domain from favorites like "big band" or "westerns" (taste signal). */
+  genreTags: Map<MediaDomain, string[]>;
+  /** All genre tag ids across domains (cross-domain fallback). */
+  allGenreTags: string[];
+  /** Release years of their teens and twenties, from their own or the home's birth year. */
+  youth?: YearRange;
   declined: Set<string>;
   loved: Set<string>;
   scorable: boolean;
@@ -258,15 +269,17 @@ export async function resolveResidents(state: PipelineState, qloo: QlooClient, t
       );
       looked.set(key, { tag });
     } else {
-      const entity = await tracer.tryCall(
+      // Genres ("big band", "westerns") resolve to Qloo genre tags, titles and names to entities.
+      const hit = await tracer.tryCall(
         "resolve_entity",
         { query: f.text, kind: f.kind },
-        () => counted(state, resolveEntity(qloo, f.kind as Exclude<typeof f.kind, "food">, f.text)),
-        (e) => (e ? `"${f.text}" → ${e.name}` : `"${f.text}" not found`),
+        () => counted(state, resolveFavorite(qloo, f.kind as Exclude<typeof f.kind, "food">, f.text)),
+        (h) => (h?.entity ? `"${f.text}" → ${h.entity.name}` : h?.tag ? `"${f.text}" → genre ${h.tag.name}` : `"${f.text}" not found`),
       );
-      looked.set(key, { entity });
+      looked.set(key, hit ?? {});
     }
   });
+  const defaultYouth = state.request.defaultBirthYear ? youthYears(state.request.defaultBirthYear) : undefined;
 
   let matched = 0;
   let missing = 0;
@@ -274,6 +287,7 @@ export async function resolveResidents(state: PipelineState, qloo: QlooClient, t
     const signals = new Map<MediaDomain, string[]>();
     const favorites: ResolvedFavorite[] = [];
     const foodTags: string[] = [];
+    const genreTags = new Map<MediaDomain, string[]>();
     const warnings: string[] = [];
     for (const f of r.favorites) {
       const hit = looked.get(keyOf(f));
@@ -290,7 +304,12 @@ export async function resolveResidents(state: PipelineState, qloo: QlooClient, t
         if (domainsInWeek(state).has(d)) addCandidate(state, hit.entity, d, "favorite").ownedBy.add(r.id);
       } else if (hit?.tag) {
         matched++;
-        if (!foodTags.includes(hit.tag.id)) foodTags.push(hit.tag.id);
+        const d = kindToDomain(f.kind) as MediaDomain | undefined;
+        const list = d ? (genreTags.get(d) ?? []) : foodTags;
+        if (!list.includes(hit.tag.id)) list.push(hit.tag.id);
+        if (d) genreTags.set(d, list);
+        // Explainability can cite a genre signal by tag id ("their love of Westerns").
+        if (d) state.names.set(hit.tag.id, hit.tag.name);
         favorites.push({ kind: f.kind, text: f.text, status: "matched", tag: hit.tag });
       } else {
         missing++;
@@ -308,14 +327,19 @@ export async function resolveResidents(state: PipelineState, qloo: QlooClient, t
       }
     }
     const allSignals = [...new Set([...signals.values()].flat())];
-    const scorable = allSignals.length > 0 || foodTags.length > 0;
+    const allGenreTags = [...new Set([...genreTags.values()].flat())];
+    const scorable = allSignals.length > 0 || foodTags.length > 0 || allGenreTags.length > 0;
     if (!scorable) warnings.push("None of this resident's favorites matched on Qloo, so they could not be scored. Add a few more.");
+    const youth = r.birthYear ? youthYears(r.birthYear) : defaultYouth;
     state.residents.set(r.id, {
       id: r.id,
       favorites,
       signals,
       allSignals,
       foodTags,
+      genreTags,
+      allGenreTags,
+      ...(youth ? { youth } : {}),
       declined: new Set(r.declined ?? []),
       loved: new Set(r.loved ?? []),
       scorable,
@@ -352,6 +376,67 @@ function crossSignals(state: PipelineState): string[] {
   return [...counts.entries()].sort((a, b) => b[1] - a[1]).map(([id]) => id);
 }
 
+/** Genre tag ids for a domain across the group, most-shared first. */
+function groupGenreTags(state: PipelineState, domain: MediaDomain): string[] {
+  const counts = new Map<string, number>();
+  for (const r of state.residents.values()) for (const id of r.genreTags.get(domain) ?? []) counts.set(id, (counts.get(id) ?? 0) + 1);
+  return [...counts.entries()].sort((a, b) => b[1] - a[1]).map(([id]) => id);
+}
+
+function crossGenreTags(state: PipelineState): string[] {
+  const counts = new Map<string, number>();
+  for (const r of state.residents.values()) for (const id of r.allGenreTags) counts.set(id, (counts.get(id) ?? 0) + 1);
+  return [...counts.entries()].sort((a, b) => b[1] - a[1]).map(([id]) => id);
+}
+
+/**
+ * The group's shared youth window: the median resident's teens-and-twenties years. A median keeps
+ * one much older or younger resident from shifting the window for everyone.
+ */
+export function groupYouth(rs: Iterable<ResidentState>): YearRange | undefined {
+  const ranges = [...rs].map((r) => r.youth).filter((y): y is YearRange => !!y).sort((a, b) => a.from - b.from);
+  return ranges[Math.floor((ranges.length - 1) / 2)];
+}
+
+/**
+ * Reminiscence bump: an extra, era-filtered query for film and TV, added alongside the taste query
+ * (never replacing it) so the pool keeps its breadth. If Qloo rejects or ignores the filter, the
+ * regular pool still stands and a note says so.
+ */
+async function eraCandidates(
+  state: PipelineState,
+  qloo: QlooClient,
+  tracer: Tracer,
+  domain: MediaDomain,
+  signals: string[],
+  tags: string[],
+  take: number,
+  residents: Iterable<ResidentState> = state.residents.values(),
+  source: CandidateSource = "group",
+): Promise<number> {
+  const years = ERA_DOMAINS.has(domain) ? groupYouth(residents) : undefined;
+  if (!years) return 0;
+  const exclude = [...new Set([...state.exclude, ...state.candidates.keys()])].slice(0, 50);
+  const res = await tracer.tryCall(
+    "get_era_recommendations",
+    { domain, years: `${years.from}-${years.to}`, signals: signals.length, take },
+    () => counted(state, qloo.insights(recommendParams(domain, signals, { take, exclude, tags, years }))),
+    (r) => `${r.length} ${domain} titles from ${years.from}-${years.to}${r[0] ? `, top: ${r[0].name}` : ""}`,
+  );
+  if (!res) {
+    state.notes.push(`Qloo did not return ${domain} titles for the residents' youth (${years.from}-${years.to}); the pool uses taste alone.`);
+    return 0;
+  }
+  let added = 0;
+  // Only keep titles Qloo dates inside the window, in case the filter is ever silently ignored.
+  for (const e of res) {
+    if (!inYears(e, years) || state.candidates.has(e.entity_id) || state.exclude.has(e.entity_id) || !suitableForGroup(e)) continue;
+    addCandidate(state, e, domain, source);
+    added++;
+  }
+  return added;
+}
+
 /** Bounds for agent-chosen pool sizes (Qloo budget and optimizer time). */
 export const POOL_TAKE_MIN = 5;
 export const POOL_TAKE_MAX = 40;
@@ -380,20 +465,24 @@ export async function buildCandidates(state: PipelineState, qloo: QlooClient, tr
       return;
     }
     // Same-domain signals when we have them, otherwise cross-domain taste (e.g. music fans -> films).
-    const same = groupSignals(state, domain);
-    const signals = same.length ? same : crossSignals(state);
-    if (!signals.length) {
+    const sameIds = groupSignals(state, domain);
+    const sameTags = groupGenreTags(state, domain);
+    const same = sameIds.length || sameTags.length;
+    const signals = same ? sameIds : crossSignals(state);
+    const tags = same ? sameTags : crossGenreTags(state);
+    if (!signals.length && !tags.length) {
       state.notes.push(`No ${domain} signals for this group; only the baseline list can fill ${domain} slots.`);
       return;
     }
     const exclude = [...state.exclude];
     const res = await tracer.tryCall(
       "get_recommendations",
-      { domain, signals: signals.length, take: take(domain) },
-      () => counted(state, qloo.insights(recommendParams(domain, signals, { take: take(domain), exclude, city: state.request.homeCity }))),
+      { domain, signals: signals.length, ...(tags.length ? { genres: tags.length } : {}), take: take(domain) },
+      () => counted(state, qloo.insights(recommendParams(domain, signals, { take: take(domain), exclude, city: state.request.homeCity, tags }))),
       (r) => `${r.length} ${domain} candidates${r[0] ? `, top: ${r[0].name}` : ""}`,
     );
     for (const e of res ?? []) if (suitableForGroup(e)) addCandidate(state, e, domain, "group");
+    await eraCandidates(state, qloo, tracer, domain, signals, tags, Math.max(POOL_TAKE_MIN, Math.ceil(take(domain) / 2)));
   });
   const pool = [...state.candidates.values()];
   const byDomain = [...week].map((d) => `${d} ${pool.filter((c) => c.domain === d).length}`).join(", ");
@@ -458,14 +547,17 @@ export async function expandForResidents(
     return `${added} new outing venues added for ${ids.join(", ")}`;
   }
   const rs = ids.map((id) => state.residents.get(id)!);
-  const same = [...new Set(rs.flatMap((r) => r.signals.get(domain) ?? []))];
-  const signals = same.length ? same : [...new Set(rs.flatMap((r) => r.allSignals))];
-  if (!signals.length) return "Those residents have no entity favorites to use as a signal.";
+  const sameIds = [...new Set(rs.flatMap((r) => r.signals.get(domain) ?? []))];
+  const sameTags = [...new Set(rs.flatMap((r) => r.genreTags.get(domain) ?? []))];
+  const same = sameIds.length || sameTags.length;
+  const signals = same ? sameIds : [...new Set(rs.flatMap((r) => r.allSignals))];
+  const tags = same ? sameTags : [...new Set(rs.flatMap((r) => r.allGenreTags))];
+  if (!signals.length && !tags.length) return "Those residents have no entity or genre favorites to use as a signal.";
   const exclude = [...new Set([...state.exclude, ...state.candidates.keys()])].slice(0, 50);
   const res = await tracer.tryCall(
     "get_recommendations",
-    { domain, residents: ids, signals: signals.length, take },
-    () => counted(state, qloo.insights(recommendParams(domain, signals, { take, exclude, city: state.request.homeCity }))),
+    { domain, residents: ids, signals: signals.length, ...(tags.length ? { genres: tags.length } : {}), take },
+    () => counted(state, qloo.insights(recommendParams(domain, signals, { take, exclude, city: state.request.homeCity, tags }))),
     (r) => `${r.length} ${domain} candidates for ${ids.join(", ")}`,
   );
   let added = 0;
@@ -474,7 +566,9 @@ export async function expandForResidents(
     addCandidate(state, e, domain, "expanded");
     added++;
   }
-  return `${added} new ${domain} candidates aimed at ${ids.join(", ")}`;
+  // Titles from these residents' youth, for film and TV.
+  const era = await eraCandidates(state, qloo, tracer, domain, signals, tags, Math.max(POOL_TAKE_MIN, Math.ceil(take / 2)), rs, "expanded");
+  return `${added + era} new ${domain} candidates aimed at ${ids.join(", ")}${era ? ` (${era} from their youth)` : ""}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -499,6 +593,21 @@ export async function scoreAll(state: PipelineState, qloo: QlooClient, tracer: T
     if (done) ok++;
   });
   return `Scored ${ok} of ${jobs.length} resident × session-type combinations on Qloo`;
+}
+
+/** Affinity added to titles from a resident's youth before ranking: enough to break near-ties, not to outrank clear taste. */
+export const YOUTH_BOOST = 0.03;
+
+/**
+ * Soft reminiscence bump for film and TV: titles released in the resident's teens and twenties
+ * rank a little higher among this week's options. Titles Qloo gives no year are left as they are.
+ */
+function eraBoosted(state: PipelineState, r: ResidentState, domain: Domain, scored: QlooEntity[]): QlooEntity[] {
+  if (!r.youth || domain === "outing" || !ERA_DOMAINS.has(domain)) return scored;
+  return scored.map((e) => {
+    const year = state.candidates.get(e.entity_id)?.entity ?? e;
+    return typeof e.affinity === "number" && (inYears(year, r.youth) || inYears(e, r.youth)) ? { ...e, affinity: e.affinity + YOUTH_BOOST } : e;
+  });
 }
 
 async function scoreResident(
@@ -531,9 +640,12 @@ async function scoreResident(
       res = parts;
     }
   } else {
-    const same = r.signals.get(domain) ?? [];
-    const signals = same.length ? same : r.allSignals;
-    if (!signals.length) return false;
+    const sameIds = r.signals.get(domain) ?? [];
+    const sameTags = r.genreTags.get(domain) ?? [];
+    const sameDomain = sameIds.length > 0 || sameTags.length > 0;
+    const signals = sameDomain ? sameIds : r.allSignals;
+    const tags = sameDomain ? sameTags : r.allGenreTags;
+    if (!signals.length && !tags.length) return false;
     // Qloo will not score an entity against itself as a signal; owned favorites get fit 1 anyway.
     const targets = ids.filter((id) => !signals.includes(id));
     if (!targets.length) return true;
@@ -545,9 +657,9 @@ async function scoreResident(
     for (const chunk of chunks) {
       const part = await tracer.tryCall(
         "score_resident",
-        { resident: r.id, domain, candidates: chunk.length, crossDomain: !same.length },
-        () => counted(state, qloo.insights(scoreParams(domain, signals, chunk))),
-        (x) => `${r.id}: ${x.length} ${domain} candidates scored${same.length ? "" : " (cross-domain)"}`,
+        { resident: r.id, domain, candidates: chunk.length, crossDomain: !sameDomain, ...(tags.length ? { genres: tags.length } : {}) },
+        () => counted(state, qloo.insights(scoreParams(domain, signals, chunk, tags))),
+        (x) => `${r.id}: ${x.length} ${domain} candidates scored${sameDomain ? "" : " (cross-domain)"}`,
       );
       if (!part) {
         res = undefined;
@@ -562,7 +674,7 @@ async function scoreResident(
     r.warnings.push(`Qloo scoring failed for ${domain}.`);
     return false;
   }
-  const fits = rankFits(res);
+  const fits = rankFits(eraBoosted(state, r, domain, res));
   for (const e of res) {
     const c = state.candidates.get(e.entity_id);
     if (!c) continue;
@@ -929,11 +1041,15 @@ export async function buildOneToOnes(state: PipelineState, qloo: QlooClient, tra
     const domains = DOMAINS.filter((d): d is MediaDomain => d !== "outing");
     for (const d of domains) {
       const sig = r.signals.get(d) ?? [];
-      if (!sig.length) continue;
+      const tags = r.genreTags.get(d) ?? [];
+      if (!sig.length && !tags.length) continue;
+      // A genre alone ("westerns") gives Qloo little to go on and returns recent titles (checked
+      // live); their youth years anchor it to the films they grew up with (film and TV only).
+      const years = sig.length || !r.youth ? undefined : r.youth;
       const res = await tracer.tryCall(
         "get_one_to_one",
         { resident: id, domain: d },
-        () => counted(state, qloo.insights(recommendParams(d, sig, { take: 4, exclude: sig, explain: true }))),
+        () => counted(state, qloo.insights(recommendParams(d, sig, { take: 4, exclude: sig, explain: true, tags, ...(years ? { years } : {}) }))),
         (x) => `${x.length} ${d} picks for ${id}`,
       );
       for (const e of (res ?? []).filter((e) => !r.declined.has(e.entity_id)).slice(0, 2)) {
@@ -968,8 +1084,22 @@ export function whyFor(state: PipelineState, c: CandidateState, residentId: stri
     .map((x) => state.names.get(x.entity_id)!);
   const fit = c.fit.get(residentId) ?? 0;
   const rank = `Top ${Math.max(1, Math.round((1 - fit) * 100))}% of this week's options for them`;
-  return ex.length ? `${rank}; Qloo links it to their love of ${ex.join(" and ")}.` : `${rank} on Qloo taste affinity.`;
+  const why = ex.length ? `${rank}; Qloo links it to their love of ${ex.join(" and ")}.` : `${rank} on Qloo taste affinity.`;
+  const era = youthNote(state, c, residentId);
+  return era ? `${why} ${era}` : why;
 }
+
+/** "Released in 1958, from their teens." when a film or TV pick falls in the resident's youth window. */
+export function youthNote(state: PipelineState, c: CandidateState, residentId: string): string | undefined {
+  const r = state.residents.get(residentId);
+  if (c.domain === "outing" || !ERA_DOMAINS.has(c.domain) || !inYears(c.entity, r?.youth)) return undefined;
+  const year = c.entity.properties!.release_year!;
+  const age = year - (r!.youth!.from - youthYears(0).from);
+  return `Released in ${year}, from their ${age < 20 ? "teens" : age < 30 ? "twenties" : "youth"}.`;
+}
+
+/** True when the candidate is a film or TV title from the resident's youth window. */
+const fromYouth = (state: PipelineState, c: CandidateState, residentId: string) => !!youthNote(state, c, residentId);
 
 // ---------------------------------------------------------------------------
 // Snapshot for the agent (compact, ids are aliases)
@@ -994,6 +1124,11 @@ export function snapshot(state: PipelineState) {
         candidate_id: cid ?? null,
         attendees: s.attendees.length,
         strong_matches: matches,
+        // Attendees for whom the pick was released in their teens or twenties (film and TV).
+        ...(() => {
+          const ids = c ? s.attendees.filter((r) => fromYouth(state, c, r)) : [];
+          return ids.length ? { year: c!.entity.properties?.release_year, from_youth_of: ids } : {};
+        })(),
       };
     }),
     unreached: state.assignment && state.metrics
@@ -1055,7 +1190,13 @@ export function buildPlan(state: PipelineState, now: Date = new Date()): WeekPla
     const ec = candMap.get(c.entity.entity_id)!;
     const fits = s.attendees.map((r) => fitOf(ec, r));
     const matches: SessionMatch[] = s.attendees
-      .map((r) => ({ residentId: r, fit: fitOf(ec, r), ownFavorite: c.ownedBy.has(r), why: whyFor(state, c, r) }))
+      .map((r) => ({
+        residentId: r,
+        fit: fitOf(ec, r),
+        ownFavorite: c.ownedBy.has(r),
+        why: whyFor(state, c, r),
+        ...(fromYouth(state, c, r) ? { fromYouth: true } : {}),
+      }))
       .filter((m) => m.ownFavorite || m.fit >= REACH_THRESHOLD)
       .sort((a, b) => b.fit - a.fit);
     sessions.push({
@@ -1087,7 +1228,13 @@ export function buildPlan(state: PipelineState, now: Date = new Date()): WeekPla
       .map((s) => {
         const c = state.candidates.get(state.assignment!.get(s.id)!)!;
         const ec = candMap.get(c.entity.entity_id)!;
-        return { slotId: s.id, fit: fitOf(ec, r.id), ownFavorite: c.ownedBy.has(r.id), why: whyFor(state, c, r.id) };
+        return {
+          slotId: s.id,
+          fit: fitOf(ec, r.id),
+          ownFavorite: c.ownedBy.has(r.id),
+          why: whyFor(state, c, r.id),
+          ...(fromYouth(state, c, r.id) ? { fromYouth: true } : {}),
+        };
       })
       .sort((a, b) => b.fit - a.fit);
     const best = bestFor(r.id, state.assignment!, state.slots, candMap);
@@ -1100,6 +1247,7 @@ export function buildPlan(state: PipelineState, now: Date = new Date()): WeekPla
       ...(best.slotId ? { bestSlotId: best.slotId } : {}),
       sessions: list,
       favorites: r.favorites,
+      ...(r.youth ? { youthYears: r.youth } : {}),
       careNote: "",
       warnings: [...r.warnings],
     };
@@ -1143,16 +1291,19 @@ function templateBrief(state: PipelineState, c: CandidateState, strong: number, 
 
 function careNote(state: PipelineState, o: ResidentOutcome, reqSlots: Map<string, PlanRequest["slots"][number]>): string {
   if (!o.scorable) return "Preferences not yet matched on Qloo; record more specific favorites (artists, films, shows) at next review.";
-  const favs = o.favorites.filter((f) => f.status === "matched").map((f) => f.entity?.name ?? f.tag?.name);
+  const favs = o.favorites.filter((f) => f.status === "matched").map((f) => f.entity?.name ?? f.tag?.name)
+    .filter((n): n is string => !!n);
   const top = o.sessions.filter((s) => s.ownFavorite || s.fit >= REACH_THRESHOLD).slice(0, 3);
   const when = top
     .map((s) => {
-      const r = reqSlots.get(s.slotId)!;
+      const r = reqSlots.get(s.slotId);
       const c = state.candidates.get(state.assignment!.get(s.slotId)!);
-      return `${c?.entity.name} (${DAY_NAMES[r.day]} ${r.time})`;
+      if (!r || !c?.entity.name) return "";
+      return `${c.entity.name} (${DAY_NAMES[r.day]} ${r.time})`;
     })
+    .filter(Boolean)
     .join("; ");
-  const parts = [`Documented preferences: ${favs.slice(0, 5).join(", ")}.`];
+  const parts = [favs.length ? `Documented preferences: ${favs.slice(0, 5).join(", ")}.` : "Preferences matched on Qloo via related tastes."];
   parts.push(when ? `Invited to sessions matched to these preferences: ${when}.` : "No group session this week closely matches these preferences.");
   if (o.oneToOne) parts.push(`1:1 visit planned with ${o.oneToOne.picks.slice(0, 3).map((p) => p.name).join(", ")}.`);
   return parts.join(" ");

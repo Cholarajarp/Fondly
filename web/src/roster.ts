@@ -1,7 +1,7 @@
 // Roster storage. Resident names live only in this browser (localStorage). The server, Qloo and
 // the language model only ever see aliases (r1, r2…) and public cultural favorites.
 import { useCallback, useEffect, useState } from "react";
-import type { Day, Domain, Favorite, PlanRequest, SlotInput, TimeOfDay } from "../../shared/types";
+import { BIRTH_YEAR_MAX, BIRTH_YEAR_MIN, type Day, type Domain, type Favorite, type PlanRequest, type SlotInput, type TimeOfDay } from "../../shared/types";
 
 export interface RosterResident {
   id: string;
@@ -12,12 +12,16 @@ export interface RosterResident {
   optOut: Domain[];
   loved: string[];
   declined: string[];
+  /** Optional: biases film and TV toward their teens and twenties. */
+  birthYear?: number;
 }
 
 export interface Roster {
   rosterId: string;
   homeName: string;
   homeCity: string;
+  /** Typical birth year at the home, for residents without their own. */
+  defaultBirthYear?: number;
   residents: RosterResident[];
   slots: SlotInput[];
   /** Most recent plan for this roster. */
@@ -169,10 +173,16 @@ export function toRequest(r: Roster): PlanRequest {
       ...(x.optOut.length ? { optOut: x.optOut } : {}),
       ...(x.loved.length ? { loved: x.loved } : {}),
       ...(x.declined.length ? { declined: x.declined } : {}),
+      ...(validBirthYear(x.birthYear) ? { birthYear: x.birthYear } : {}),
     })),
     slots: r.slots,
+    ...(validBirthYear(r.defaultBirthYear) ? { defaultBirthYear: r.defaultBirthYear } : {}),
   };
 }
+
+/** True for a whole year in the accepted range (the server rejects anything else). */
+export const validBirthYear = (y: unknown): y is number =>
+  typeof y === "number" && Number.isInteger(y) && y >= BIRTH_YEAR_MIN && y <= BIRTH_YEAR_MAX;
 
 /** Folds a server request (after re-planning) back into the local roster, keeping names. */
 export function mergeRequest(r: Roster, req: PlanRequest): Roster {
@@ -188,6 +198,7 @@ export function mergeRequest(r: Roster, req: PlanRequest): Roster {
       optOut: x.optOut ?? [],
       loved: x.loved ?? [],
       declined: x.declined ?? [],
+      ...(x.birthYear !== undefined ? { birthYear: x.birthYear } : {}),
     })),
     slots: req.slots,
   };

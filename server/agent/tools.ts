@@ -22,6 +22,7 @@ import {
   type PipelineState,
 } from "../engine/pipeline.ts";
 import { clip, type Tracer } from "../engine/trace.ts";
+import { scheduleOlderAdults } from "../engine/enrich.ts";
 
 export interface ToolDefinition {
   name: string;
@@ -303,8 +304,10 @@ const handlers: { [K in ToolName]: Handler<K> } = {
       ...(ctx.done.has("build_baseline") ? [] : ["build_baseline has not run: the baseline comparison is missing and cannot seed the optimizer."]),
       ...(snap.unfetched_types.length ? [`No group pool fetched yet for: ${snap.unfetched_types.join(", ")}.`] : []),
     ];
+    // Qloo audience data for briefs ("popular with people 55 and older"); best-effort, never fails the tool.
+    const older = await scheduleOlderAdults(ctx.state, ctx.qloo, ctx.tracer);
     return {
-      content: json({ ...snap, ...(warnings.length ? { warnings } : {}) }),
+      content: json({ ...snap, ...(older.length ? { loved_by_55_plus: older } : {}), ...(warnings.length ? { warnings } : {}) }),
       summary: `reached ${metrics.reached}/${metrics.total}, least-served fit ${metrics.minBest}, unreached: ${unreached.length ? unreached.join(", ") : "none"}`,
       isError: false,
     };

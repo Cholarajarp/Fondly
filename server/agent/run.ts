@@ -9,10 +9,13 @@ import {
 } from "@google/genai";
 import { z } from "zod";
 import {
+  BIRTH_YEAR_MAX,
+  BIRTH_YEAR_MIN,
   DAYS,
   DOMAINS,
   FAVORITE_KINDS,
   TIMES,
+  youthYears,
   type AgentEvent,
   type AgentRunAccount,
   type PlanRequest,
@@ -36,6 +39,7 @@ import {
   type KnownEntity,
 } from "../engine/pipeline.ts";
 import { Tracer, clip, errMsg, safeReason } from "../engine/trace.ts";
+import { enrichPlan } from "../engine/enrich.ts";
 import { AgentError, generateJson, generateWithRetry, modelConfig, type GeminiClient } from "./gemini.ts";
 import { LLM_BASELINE_PROMPT, SYSTEM_PROMPT } from "./prompt.ts";
 import { PLAN_STEPS, TOOL_DEFINITIONS, createToolCtx, executeTool, toolReason, type PlanStep, type ToolCtx } from "./tools.ts";
@@ -53,6 +57,7 @@ const time = z.enum(TIMES);
 // Entity ids are joined into comma-separated Qloo params, so only id-safe characters are accepted.
 const entityId = z.string().regex(/^[A-Za-z0-9_:-]{1,100}$/, "Expected a Qloo entity id");
 const domain = z.enum(DOMAINS as unknown as [string, ...string[]]);
+const birthYear = z.number().int().min(BIRTH_YEAR_MIN).max(BIRTH_YEAR_MAX);
 
 export const ResidentSchema = z
   .object({
@@ -65,6 +70,7 @@ export const ResidentSchema = z
     optOut: z.array(domain).max(DOMAINS.length).optional(),
     loved: z.array(entityId).max(40).optional(),
     declined: z.array(entityId).max(40).optional(),
+    birthYear: birthYear.optional(),
   })
   .strict();
 
@@ -77,6 +83,7 @@ export const PlanRequestSchema = z
     rosterId: z.string().regex(/^[a-zA-Z0-9_-]{6,64}$/),
     homeName: z.string().trim().max(80).optional(),
     homeCity: text(100),
+    defaultBirthYear: birthYear.optional(),
     residents: z
       .array(ResidentSchema)
       .min(2, "Add at least 2 residents")
@@ -169,6 +176,10 @@ export async function runFondlyAgent(req: PlanRequest, deps: RunDeps): Promise<W
   await ensureComplete(ctx, deps.emit);
   checkAbort();
   const plan = buildPlan(state, (deps.now ?? (() => new Date()))());
+  // Best-effort extras ("Loved by 55+" badges, outing areas); never break the plan.
+  deps.emit({ kind: "status", message: "Adding audience badges and outing ideas" });
+  await enrichPlan(plan, state, deps.qloo, tracer);
+  checkAbort();
   plan.agentRun = accountRun(ctx);
   return plan;
 }
@@ -185,6 +196,13 @@ function reasonOf(err: unknown): string {
 // Agent loop
 // ---------------------------------------------------------------------------
 
+/** Teens-and-twenties release years, so briefs can say a film is "from their youth". */
+const youthOf = (birthYear: number | undefined) => {
+  if (!birthYear) return {};
+  const y = youthYears(birthYear);
+  return { youth_years: `${y.from}-${y.to}` };
+};
+
 function initialMessage(state: PipelineState): string {
   const r = state.request;
   const data = {
@@ -195,6 +213,7 @@ function initialMessage(state: PipelineState): string {
       unavailable: [...(x.unavailableDays ?? []), ...(x.unavailableTimes ?? [])],
       opt_out: x.optOut ?? [],
       has_history: Boolean(x.loved?.length || x.declined?.length),
+      ...youthOf(x.birthYear ?? r.defaultBirthYear),
     })),
     slots: r.slots.map((s) => ({ id: s.id, day: s.day, time: s.time, type: s.domain })),
     mode: state.exclude.size ? "next_week (last week's titles are excluded)" : state.locked.size ? "edit (some slots are kept)" : "new",

@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Typecheck and build only: no API keys or secrets are needed. Tests are kept local, not in the repo.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          # Matches package.json engines (>=22.19) and render.yaml NODE_VERSION.
+          node-version: 22.20.0
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build
