@@ -9,11 +9,20 @@ import type { GeminiClient } from "./agent/run.ts";
 import type { QlooClient } from "../shared/types.ts";
 import { config, missingKeys as defaultMissingKeys } from "./config.ts";
 import { createPlansStore, type PlansStore } from "./plans-store.ts";
+import { createInvitesStore, type InvitesStore } from "./invites-store.ts";
+import { createFamilyRouter, type FamilyLimits } from "./routes/family.ts";
 import { createHealthRouter } from "./routes/health.ts";
 import { createPlanRouter, type RunAgent } from "./routes/plan.ts";
+import { createKitRouter } from "./routes/kits.ts";
+import { createKitStore, type KitStore } from "./kits/store.ts";
 
 export interface AppDeps {
   store?: PlansStore;
+  kitStore?: KitStore;
+  /** Gemini kit generations per IP per hour (cache hits are free). Defaults to 3x the plan limit. */
+  kitPerHourLimit?: number;
+  invites?: InvitesStore;
+  familyLimits?: Partial<FamilyLimits>;
   getQloo?: () => QlooClient;
   getGemini?: () => GeminiClient;
   runAgent?: RunAgent;
@@ -78,16 +87,19 @@ export function createApp(deps: AppDeps = {}): Express {
 
   if (deps.logRequests ?? config.NODE_ENV !== "test") app.use(requestLogger);
   app.use(securityHeaders);
+  // Family link bodies are small (at most 45 short items), so they get a tighter limit, parsed first.
+  app.use(["/api/invites", "/api/family"], express.json({ limit: "16kb" }));
   // A full roster (60 residents x 20 favorites) plus replan reactions fits well under this; zod bounds every field.
   app.use(express.json({ limit: "256kb" }));
 
   const missingKeys = deps.missingKeys ?? defaultMissingKeys;
   const store = deps.store ?? createPlansStore(config.CACHE_DIR);
+  const qlooConfigured = deps.qlooConfigured ?? (() => !missingKeys().includes("QLOO_API_KEY"));
 
   app.use(
     "/api",
     createHealthRouter({
-      qlooConfigured: deps.qlooConfigured ?? (() => !missingKeys().includes("QLOO_API_KEY")),
+      qlooConfigured,
       llmConfigured: deps.llmConfigured ?? (() => !missingKeys().includes("GEMINI_API_KEY")),
       model: deps.model ?? config.GEMINI_MODEL,
     }),
@@ -105,6 +117,31 @@ export function createApp(deps: AppDeps = {}): Express {
       dailyCap: deps.dailyCap ?? config.DAILY_PLAN_CAP,
       maxConcurrent: deps.maxConcurrent ?? 3,
       heartbeatMs: deps.heartbeatMs,
+    }),
+  );
+
+  const perHour = deps.perHourLimit ?? config.PUBLIC_RATE_LIMIT_PER_HOUR;
+  const daily = deps.dailyCap ?? config.DAILY_PLAN_CAP;
+  app.use(
+    "/api",
+    createKitRouter({
+      plans: store,
+      kits: deps.kitStore ?? createKitStore(config.CACHE_DIR),
+      getGemini: deps.getGemini ?? (() => notConfigured("Gemini")),
+      llmConfigured: deps.llmConfigured ?? (() => !missingKeys().includes("GEMINI_API_KEY")),
+      perHourLimit: deps.kitPerHourLimit ?? perHour * 3,
+      // A plan has at most 21 sessions; allow a kit for every session of every daily plan.
+      dailyCap: daily * 21,
+    }),
+  );
+
+  app.use(
+    "/api",
+    createFamilyRouter({
+      store: deps.invites ?? createInvitesStore(config.CACHE_DIR),
+      getQloo: deps.getQloo ?? (() => notConfigured("Qloo")),
+      qlooConfigured,
+      limits: deps.familyLimits,
     }),
   );
 

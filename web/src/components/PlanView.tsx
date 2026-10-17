@@ -3,12 +3,46 @@ import { DAYS, TIMES, type Reaction, type ScheduledSession, type WeekPlan } from
 import { nameOf, type Roster } from "../roster";
 import { Markdown } from "./Markdown";
 import { DOMAIN_LABEL, initials } from "./RosterEditor";
+import { SLOT_TIMES } from "../../../shared/ics";
+import { printSheet } from "./Modal";
+import { downloadIcs, KitDialog, NoticeboardPoster } from "./SessionKit";
 
 const DAY_LONG: Record<string, string> = { Mon: "Monday", Tue: "Tuesday", Wed: "Wednesday", Thu: "Thursday", Fri: "Friday", Sat: "Saturday", Sun: "Sunday" };
 const pct = (n: number) => `${Math.round(n * 100)}%`;
 const order = (s: { day: string; time: string }) => DAYS.indexOf(s.day as never) * 3 + TIMES.indexOf(s.time as never);
 
 type Tab = "week" | "residents" | "families" | "next";
+
+const STEP_LABEL: Record<string, string> = {
+  resolve_favorites: "matching favorites",
+  build_candidates: "candidate pool",
+  score_residents: "scoring",
+  build_baseline: "baseline",
+  optimize: "optimizing",
+  plan_one_to_ones: "1:1 plans",
+  record_sessions: "session briefs",
+  finish: "summary and newsletter",
+};
+
+/** Who did the work: the agent, or the deterministic safety net. Counts come from code, not the model. */
+function AgentRunLine({ plan }: { plan: WeekPlan }) {
+  const run = plan.agentRun;
+  if (!run) return null;
+  const net = run.steps.filter((s) => s.by === "safety_net").map((s) => STEP_LABEL[s.step] ?? s.step);
+  const helped = run.steps.filter((s) => s.by === "both").map((s) => STEP_LABEL[s.step] ?? s.step);
+  const extra = [run.expansions && `${run.expansions} expansion${run.expansions === 1 ? "" : "s"}`, run.revisions && `${run.revisions} revision${run.revisions === 1 ? "" : "s"}`].filter(Boolean);
+  const head = !net.length && !helped.length ? "Agent-driven: all steps" : net.length === run.steps.length ? "Built by the safety net (the agent did not run)" : "Agent-driven, with safety-net help";
+  const parts = [
+    `${run.toolCalls} agent tool call${run.toolCalls === 1 ? "" : "s"}${extra.length ? `, ${extra.join(", ")}` : ""}`,
+    net.length && net.length !== run.steps.length ? `safety net did: ${net.join(", ")}` : "",
+    helped.length ? `safety net completed: ${helped.join(", ")}` : "",
+  ].filter(Boolean);
+  return (
+    <p className="agent-run">
+      {head} ({parts.join("; ")}).
+    </p>
+  );
+}
 
 // ---------------------------------------------------------------------------
 // Fairness panel
@@ -50,6 +84,7 @@ function Fairness({ plan }: { plan: WeekPlan }) {
               <div className="d">{plan.qlooRequests} Qloo requests</div>
             </div>
           </div>
+          <AgentRunLine plan={plan} />
           {unscorable > 0 && (
             <p className="hint" style={{ marginTop: "0.75rem" }}>
               {unscorable} resident{unscorable === 1 ? "" : "s"} could not be scored because none of their favorites matched on Qloo. See Residents.
@@ -101,7 +136,48 @@ function Thumb({ s }: { s: ScheduledSession }) {
   );
 }
 
-function SessionCard({ s, roster }: { s: ScheduledSession; roster: Roster }) {
+/** Qloo audience badge: text label (not color-only), with the source spelled out for screen readers. */
+function Loved55({ affinity }: { affinity: number }) {
+  const label = `Loved by 55+: Qloo's audience data shows this is most popular with people 55 and older (affinity ${affinity.toFixed(2)})`;
+  return (
+    <span className="badge badge-brand" title={label}>
+      <span aria-hidden="true">Loved by 55+</span>
+      <span className="sr-only">{label}</span>
+    </span>
+  );
+}
+
+function OutingIdeas({ plan }: { plan: WeekPlan }) {
+  const areas = plan.outingIdeas ?? [];
+  if (!areas.length) return null;
+  return (
+    <section className="card" aria-labelledby="outing-ideas-h">
+      <h2 id="outing-ideas-h">Outing ideas near {plan.request.homeCity}</h2>
+      <p className="hint">Areas where this group's taste clusters on Qloo's heatmap. Check access and opening times before booking.</p>
+      <ol className="outing-ideas">
+        {areas.map((a) => (
+          <li key={`${a.lat},${a.lon}`}>
+            <strong>{a.name}</strong>
+            <span className="hint"> · {a.why}</span>
+          </li>
+        ))}
+      </ol>
+    </section>
+  );
+}
+
+/** "From their youth": the title came out in strongly matched residents' teens or twenties. */
+function FromYouth({ s }: { s: ScheduledSession }) {
+  const n = s.matches.filter((m) => m.fromYouth).length;
+  if (!n) return null;
+  return (
+    <span className="badge badge-era" title="Released when these residents were in their teens or twenties, the years people tend to remember most">
+      From their youth{n > 1 ? ` · ${n} residents` : ""}
+    </span>
+  );
+}
+
+function SessionCard({ s, roster, onOpenKit }: { s: ScheduledSession; roster: Roster; onOpenKit: (slotId: string) => void }) {
   const strong = s.matches.length;
   return (
     <article className={`session dom-${s.domain}`} aria-labelledby={`ses-${s.slotId}`}>
@@ -122,10 +198,12 @@ function SessionCard({ s, roster }: { s: ScheduledSession; roster: Roster }) {
           </div>
         </div>
       </div>
-      <div>
+      <div className="badge-row">
         <span className={`badge ${strong >= 2 ? "badge-sage" : strong === 1 ? "badge-warn" : ""}`}>
           Strong match for {strong} of {s.attendees.length}
         </span>
+        {s.olderAdults?.loved && <Loved55 affinity={s.olderAdults.affinity} />}
+        <FromYouth s={s} />
       </div>
       {strong > 0 && (
         <ul className="who" aria-label="Strongly matched residents">
@@ -137,6 +215,9 @@ function SessionCard({ s, roster }: { s: ScheduledSession; roster: Roster }) {
           ))}
         </ul>
       )}
+      <button type="button" className="btn btn-ghost btn-sm kit-open no-print" onClick={() => onOpenKit(s.slotId)} aria-label={`Open session kit for ${s.title || s.entity.name}`}>
+        Open kit
+      </button>
       <details>
         <summary>Staff brief</summary>
         <Markdown source={s.brief} />
@@ -206,7 +287,14 @@ function Residents({ plan, roster }: { plan: WeekPlan; roster: Roster }) {
             )}
             {r.oneToOne && (
               <div className="one2one">
-                <strong>1:1 visit idea:</strong> {r.oneToOne.picks.map((p) => p.name).join(", ")}
+                <strong>1:1 visit idea:</strong>{" "}
+                {r.oneToOne.picks.map((p, i) => (
+                  <span key={p.entity_id}>
+                    {i > 0 ? ", " : ""}
+                    {p.name}
+                    {r.oneToOne!.olderAdults?.[p.entity_id]?.loved && <> <Loved55 affinity={r.oneToOne!.olderAdults[p.entity_id]!.affinity} /></>}
+                  </span>
+                ))}
               </div>
             )}
             {r.warnings.length > 0 && (
@@ -448,6 +536,17 @@ export function PlanView({ plan, roster, onReplan, onEditRoster, busy, disabledR
     ...(mine ? [{ id: "next" as Tab, label: "Next week" }] : []),
   ];
   const homeName = plan.request.homeName || roster.homeName;
+  const [kitSlot, setKitSlot] = useState<string | null>(null);
+  const kitSession = kitSlot ? plan.sessions.find((s) => s.slotId === kitSlot) : undefined;
+  const [exportMsg, setExportMsg] = useState("");
+  const addToCalendar = () => {
+    try {
+      const monday = downloadIcs(plan);
+      setExportMsg(`Downloaded fondly-week.ics for the week of ${monday.toLocaleDateString(undefined, { day: "numeric", month: "long" })}.`);
+    } catch {
+      setExportMsg("Could not create the calendar file in this browser.");
+    }
+  };
 
   return (
     <article className="plan" aria-labelledby="plan-h">
@@ -466,6 +565,16 @@ export function PlanView({ plan, roster, onReplan, onEditRoster, busy, disabledR
           <button type="button" className="btn btn-ghost" onClick={() => window.print()}>
             Print
           </button>
+          {sessions.length > 0 && (
+            <>
+              <button type="button" className="btn btn-ghost" onClick={addToCalendar} aria-describedby="export-note">
+                Add to calendar
+              </button>
+              <button type="button" className="btn btn-ghost" onClick={() => printSheet("poster")} aria-describedby="export-note">
+                Noticeboard poster
+              </button>
+            </>
+          )}
           {mine && (
             <button type="button" className="btn btn-ghost" onClick={onEditRoster}>
               Edit roster
@@ -473,6 +582,16 @@ export function PlanView({ plan, roster, onReplan, onEditRoster, busy, disabledR
           )}
         </div>
       </div>
+
+      {sessions.length > 0 && (
+        <p id="export-note" className="hint no-print export-note">
+          Calendar and poster use next week, Monday to Sunday, at {SLOT_TIMES.morning.label} for mornings, {SLOT_TIMES.afternoon.label} for afternoons and{" "}
+          {SLOT_TIMES.evening.label} for evenings. The poster shows no resident names.
+          <span role="status" className="export-status">
+            {exportMsg ? ` ${exportMsg}` : ""}
+          </span>
+        </p>
+      )}
 
       {!mine && <p className="notice">This plan was made on another device, so residents show as aliases (r1, r2…). Names never leave the device they were entered on.</p>}
 
@@ -501,9 +620,10 @@ export function PlanView({ plan, roster, onReplan, onEditRoster, busy, disabledR
         )}
         <div className="cal">
           {sessions.map((s) => (
-            <SessionCard key={s.slotId} s={s} roster={view} />
+            <SessionCard key={s.slotId} s={s} roster={view} onOpenKit={setKitSlot} />
           ))}
         </div>
+        <OutingIdeas plan={plan} />
         {plan.notes.length > 0 && (
           <section className="card" aria-labelledby="notes-h">
             <h2 id="notes-h">Notes and limits</h2>
@@ -540,6 +660,9 @@ export function PlanView({ plan, roster, onReplan, onEditRoster, busy, disabledR
           <NextWeek plan={plan} roster={view} onReplan={onReplan} busy={busy} disabledReason={disabledReason} />
         </div>
       )}
+
+      {kitSession && <KitDialog plan={plan} s={kitSession} onClose={() => setKitSlot(null)} />}
+      {sessions.length > 0 && <NoticeboardPoster plan={plan} />}
 
       <p className="footnote">
         Matches are Qloo's aggregate taste affinities, ranked per resident. They describe taste, not health or ability, and do not replace knowing the person. Always

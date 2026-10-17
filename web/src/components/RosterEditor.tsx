@@ -1,6 +1,10 @@
 import { useEffect, useId, useRef, useState } from "react";
 import { DAYS, DOMAINS, FAVORITE_KINDS, TIMES, type Day, type Domain, type FavoriteKind, type TimeOfDay } from "../../../shared/types";
 import { describeError, parseIntake } from "../api";
+import type { FamilyLinks } from "../family";
+import { FamilyLinkPanel, FamilyStatusBadge } from "./FamilyLinkPanel";
+import { RosterBackup } from "./RosterBackup";
+import { BirthYearInput } from "./BirthYearInput";
 import { WEEK_PRESETS, newResident, redactIntake, nextSlotId, sampleRoster, type Roster, type RosterResident, type WeekPreset } from "../roster";
 
 export const KIND_LABEL: Record<FavoriteKind, string> = {
@@ -66,8 +70,12 @@ function ResidentRow({
   onRemove,
   intakeEnabled,
   residents,
+  links,
+  defaultBirthYear,
 }: {
   r: RosterResident;
+  links: FamilyLinks;
+  defaultBirthYear?: number;
   residents: RosterResident[];
   onChange: (r: RosterResident) => void;
   onRemove: () => void;
@@ -114,6 +122,7 @@ function ResidentRow({
     }
   };
 
+  const family = links.stateOf(r.id);
   const summary = r.favorites.length ? r.favorites.slice(0, 4).map((f) => f.text).join(", ") + (r.favorites.length > 4 ? "…" : "") : "No favorites yet";
 
   return (
@@ -126,6 +135,7 @@ function ResidentRow({
           <span style={{ minWidth: 0 }}>
             <span className="resident-name">{r.name || "Unnamed resident"}</span>
             <span className="resident-sub">{summary}</span>
+            <FamilyStatusBadge state={family} />
           </span>
           <span className="alias" title="The only identifier sent to the server">
             {r.id}
@@ -201,6 +211,7 @@ function ResidentRow({
               </div>
             </div>
           )}
+          <FamilyLinkPanel r={r} state={family} links={links} onChange={onChange} />
           <div className="field">
             <span className="label">Not available</span>
             <div className="toggle-row">
@@ -216,6 +227,16 @@ function ResidentRow({
               ))}
             </div>
           </div>
+          <BirthYearInput
+            id={`${id}-born`}
+            label="Birth year (optional, sent as a year only)"
+            value={r.birthYear}
+            fallback={defaultBirthYear}
+            onChange={(birthYear) => {
+              const { birthYear: _drop, ...rest } = r;
+              onChange(birthYear === undefined ? rest : { ...rest, birthYear });
+            }}
+          />
           <div className="field">
             <span className="label">Doesn't want</span>
             <div className="toggle-row">
@@ -392,9 +413,10 @@ interface Props {
   busy: boolean;
   intakeEnabled: boolean;
   disabledReason?: string;
+  familyLinks: FamilyLinks;
 }
 
-export function RosterEditor({ roster, update, onPlan, onReset, canPlan, busy, intakeEnabled, disabledReason }: Props) {
+export function RosterEditor({ roster, update, onPlan, onReset, canPlan, busy, intakeEnabled, disabledReason, familyLinks }: Props) {
   const [newName, setNewName] = useState("");
   const [tried, setTried] = useState(false);
   const withFavs = roster.residents.filter((r) => r.favorites.length > 0).length;
@@ -446,6 +468,17 @@ export function RosterEditor({ roster, update, onPlan, onReset, canPlan, busy, i
             <label htmlFor="home-city">Town or city</label>
             <input id="home-city" value={roster.homeCity} maxLength={100} placeholder="e.g. Austin, TX" onChange={(e) => update((r) => ({ ...r, homeCity: e.target.value }))} />
           </div>
+          <BirthYearInput
+            id="home-born"
+            label="Typical birth year of residents (optional)"
+            value={roster.defaultBirthYear}
+            onChange={(y) =>
+              update((r) => {
+                const { defaultBirthYear: _drop, ...rest } = r;
+                return y === undefined ? rest : { ...rest, defaultBirthYear: y };
+              })
+            }
+          />
         </div>
       </div>
 
@@ -476,8 +509,13 @@ export function RosterEditor({ roster, update, onPlan, onReset, canPlan, busy, i
               r={r}
               residents={roster.residents}
               intakeEnabled={intakeEnabled}
+              links={familyLinks}
+              defaultBirthYear={roster.defaultBirthYear}
               onChange={(next) => update((x) => ({ ...x, residents: x.residents.map((y) => (y.id === r.id ? next : y)) }))}
-              onRemove={() => update((x) => ({ ...x, residents: x.residents.filter((y) => y.id !== r.id) }))}
+              onRemove={() => {
+                familyLinks.forget(r.id);
+                update((x) => ({ ...x, residents: x.residents.filter((y) => y.id !== r.id) }));
+              }}
             />
           ))}
         </ul>
@@ -500,6 +538,7 @@ export function RosterEditor({ roster, update, onPlan, onReset, canPlan, busy, i
             Add resident
           </button>
         </div>
+        <RosterBackup roster={roster} update={update} familyLinks={familyLinks} />
       </div>
 
       <WeekTemplate roster={roster} update={update} />

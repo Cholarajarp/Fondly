@@ -34,6 +34,8 @@ export interface OptimizeInput {
   locked?: Map<string, string>;
   /** Candidate ids that may not be used (e.g. shown last week). */
   exclude?: Set<string>;
+  /** Per-slot bans: slotId -> candidate ids that may not be placed in that slot. */
+  slotBans?: Map<string, Set<string>>;
   /** Optional starting assignment (local search may change it, unlike `locked`). */
   initial?: Map<string, string>;
   maxPasses?: number;
@@ -116,6 +118,8 @@ export function optimize(input: OptimizeInput): Assignment {
   const cands = new Map(input.candidates.map((c) => [c.id, c]));
   const pool = (domain: Domain) =>
     input.candidates.filter((c) => c.domain === domain && !exclude.has(c.id));
+  const banned = (slotId: string, cid: string) => input.slotBans?.get(slotId)?.has(cid) ?? false;
+  const poolFor = (s: EngineSlot) => pool(s.domain).filter((c) => !banned(s.id, c.id));
 
   const bySlot = new Map<string, string>();
   const used = new Set<string>();
@@ -124,7 +128,7 @@ export function optimize(input: OptimizeInput): Assignment {
       const slot = slots.find((s) => s.id === sid);
       const c = cands.get(cid);
       if (!slot || !c || c.domain !== slot.domain || bySlot.has(sid) || used.has(cid)) continue;
-      if (!allowExcluded && exclude.has(cid)) continue;
+      if (!allowExcluded && (exclude.has(cid) || banned(sid, cid))) continue;
       bySlot.set(sid, cid);
       used.add(cid);
     }
@@ -134,12 +138,12 @@ export function optimize(input: OptimizeInput): Assignment {
 
   // Greedy: fill slots in order of how few options they have, maximizing marginal gain
   // for the residents who are currently worst served.
-  const open = slots.filter((s) => !bySlot.has(s.id)).sort((a, b) => pool(a.domain).length - pool(b.domain).length);
+  const open = slots.filter((s) => !bySlot.has(s.id)).sort((a, b) => poolFor(a).length - poolFor(b).length);
   for (const s of open) {
     const current = residentFits(bySlot, slots, cands, residents);
     let bestId: string | undefined;
     let bestScore = -Infinity;
-    for (const c of pool(s.domain)) {
+    for (const c of poolFor(s)) {
       if (used.has(c.id)) continue;
       let score = 0;
       for (const r of s.attendees) {
@@ -169,7 +173,7 @@ export function optimize(input: OptimizeInput): Assignment {
 
     // Move 1: replace one slot's candidate with an unused candidate of the same domain.
     for (const s of free) {
-      for (const c of pool(s.domain)) {
+      for (const c of poolFor(s)) {
         if (used.has(c.id)) continue;
         const prev = bySlot.get(s.id);
         bySlot.set(s.id, c.id);
@@ -192,7 +196,7 @@ export function optimize(input: OptimizeInput): Assignment {
         if (a.domain !== b.domain) continue;
         const ca = bySlot.get(a.id);
         const cb = bySlot.get(b.id);
-        if (!ca || !cb) continue;
+        if (!ca || !cb || banned(a.id, cb) || banned(b.id, ca)) continue;
         bySlot.set(a.id, cb);
         bySlot.set(b.id, ca);
         const m = computeMetrics(bySlot, slots, cands, residents);
@@ -215,10 +219,12 @@ export function optimize(input: OptimizeInput): Assignment {
 /**
  * Runs the optimizer from a greedy start and from each seed assignment, returning the best result.
  * Seeding from the baselines guarantees the plan is never worse than a baseline built from the same pool.
+ * With `stable`, the result from that seed (the current schedule) wins ties, so a re-run only changes
+ * picks when the objective actually improves.
  */
-export function optimizeBest(input: OptimizeInput, seeds: Map<string, string>[] = []): Assignment {
-  let best = optimize(input);
-  for (const s of seeds) {
+export function optimizeBest(input: OptimizeInput, seeds: Map<string, string>[] = [], stable?: Map<string, string>): Assignment {
+  let best = stable ? optimize({ ...input, initial: stable }) : optimize(input);
+  for (const s of stable ? [new Map<string, string>(), ...seeds] : seeds) {
     const a = optimize({ ...input, initial: s });
     if (better(a.metrics, best.metrics)) best = a;
   }

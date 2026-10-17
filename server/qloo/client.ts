@@ -2,7 +2,8 @@
 // Responses are cached server-side (private cache, see cache.ts) to respect the event quota.
 import {
   QlooError,
-  type AgeAffinity,
+  type AgeBucket,
+  type EntityDemographics,
   type EntityType,
   type HeatmapCell,
   type QlooClient,
@@ -219,19 +220,25 @@ export function normalizeHeatmap(body: unknown): HeatmapCell[] {
   return out;
 }
 
-const AGE_KEYS: AgeAffinity["age"][] = ["35_and_younger", "36_to_55", "55_and_older"];
+const AGE_KEYS: AgeBucket[] = ["24_and_younger", "25_to_29", "30_to_34", "35_to_44", "45_to_54", "55_and_older"];
 
-export function normalizeDemographics(body: unknown): AgeAffinity[] {
+/** One row per signal entity: `{ entity_id, query: { age: { "55_and_older": 0.39, ... } } }` (values -1..1). */
+export function normalizeDemographics(body: unknown): EntityDemographics[] {
   const r = results(body);
   const items = isObj(r) ? r.demographics : undefined;
   if (!Array.isArray(items)) return [];
-  const first = items.find((i) => isObj(i) && isObj(i.query) && isObj(i.query.age));
-  if (!isObj(first) || !isObj(first.query) || !isObj(first.query.age)) return [];
-  const age = first.query.age;
-  const out: AgeAffinity[] = [];
-  for (const key of AGE_KEYS) {
-    const v = num(age[key]);
-    if (v !== undefined) out.push({ age: key, affinity: v });
+  const out: EntityDemographics[] = [];
+  for (const item of items) {
+    if (!isObj(item) || !isObj(item.query) || !isObj(item.query.age)) continue;
+    const entity_id = str(item.entity_id);
+    if (!entity_id) continue;
+    const src = item.query.age;
+    const age: EntityDemographics["age"] = {};
+    for (const key of AGE_KEYS) {
+      const v = num(src[key]);
+      if (v !== undefined) age[key] = Math.max(-1, Math.min(1, v));
+    }
+    if (Object.keys(age).length) out.push({ entity_id, age });
   }
   return out;
 }
@@ -398,10 +405,12 @@ export function createQlooClient(opts: QlooClientOptions = {}): QlooClient {
       if (types?.length) params.types = types.join(",");
       return get("/search", params, normalizeSearch);
     },
-    async searchTags(query: string, take = 20) {
+    async searchTags(query: string, take = 20, types?: string[]) {
       requireKey();
       checkTake(take, "/v2/tags");
-      return get("/v2/tags", { "filter.query": query, take }, normalizeTags);
+      const params: Record<string, string | number> = { "filter.query": query, take };
+      if (types?.length) params["filter.tag.types"] = types.join(",");
+      return get("/v2/tags", params, normalizeTags);
     },
     async insights(params: InsightsParams) {
       requireKey();

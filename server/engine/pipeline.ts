@@ -19,6 +19,8 @@ import {
   type ScheduledSession,
   type SessionMatch,
   type WeekPlan,
+  type YearRange,
+  youthYears,
 } from "../../shared/types.ts";
 import {
   bestFor,
@@ -34,6 +36,7 @@ import {
   BASELINE_TAKE,
   GROUP_TAKE,
   ONE_TO_ONE_TAKE,
+  OUTING_TAKE,
   RELATED_TAKE,
   SCORE_TAKE,
   baselineParams,
@@ -43,9 +46,12 @@ import {
   rankFits,
   recommendParams,
   resolveEntity,
+  resolveFavorite,
   resolveFoodTag,
   scoreParams,
   suitableForGroup,
+  ERA_DOMAINS,
+  inYears,
 } from "./qloo-ops.ts";
 import { Tracer, clip, errMsg, mapLimit } from "./trace.ts";
 
@@ -60,6 +66,12 @@ export interface ResidentState {
   /** All entity signal ids across domains (cross-domain taste signal). */
   allSignals: string[];
   foodTags: string[];
+  /** Genre tag ids per domain from favorites like "big band" or "westerns" (taste signal). */
+  genreTags: Map<MediaDomain, string[]>;
+  /** All genre tag ids across domains (cross-domain fallback). */
+  allGenreTags: string[];
+  /** Release years of their teens and twenties, from their own or the home's birth year. */
+  youth?: YearRange;
   declined: Set<string>;
   loved: Set<string>;
   scorable: boolean;
@@ -106,6 +118,14 @@ export interface PipelineState {
   writtenFor: Map<string, string>;
   summary: string | null;
   newsletter: string | null;
+  /** Session types whose group pool was fetched, with the pool size used. */
+  fetched: Map<Domain, number>;
+  /** Agent revisions (revise_plan). Pins never bypass availability, opt-outs or declines. */
+  pins: Map<string, string>;
+  /** Candidate ids the agent removed from the whole week. */
+  weekBans: Set<string>;
+  /** slotId -> candidate ids the agent removed from that slot. */
+  slotBans: Map<string, Set<string>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -156,10 +176,14 @@ export function createState(
     writtenFor: new Map(),
     summary: null,
     newsletter: null,
+    fetched: new Map(),
+    pins: new Map(),
+    weekBans: new Set(),
+    slotBans: new Map(),
   };
 }
 
-const domainsInWeek = (state: PipelineState): Set<Domain> => new Set(state.request.slots.map((s) => s.domain));
+export const domainsInWeek = (state: PipelineState): Set<Domain> => new Set(state.request.slots.map((s) => s.domain));
 
 /** Scorable residents who can attend at least one slot. */
 export function scoredResidents(state: PipelineState): string[] {
@@ -245,15 +269,17 @@ export async function resolveResidents(state: PipelineState, qloo: QlooClient, t
       );
       looked.set(key, { tag });
     } else {
-      const entity = await tracer.tryCall(
+      // Genres ("big band", "westerns") resolve to Qloo genre tags, titles and names to entities.
+      const hit = await tracer.tryCall(
         "resolve_entity",
         { query: f.text, kind: f.kind },
-        () => counted(state, resolveEntity(qloo, f.kind as Exclude<typeof f.kind, "food">, f.text)),
-        (e) => (e ? `"${f.text}" → ${e.name}` : `"${f.text}" not found`),
+        () => counted(state, resolveFavorite(qloo, f.kind as Exclude<typeof f.kind, "food">, f.text)),
+        (h) => (h?.entity ? `"${f.text}" → ${h.entity.name}` : h?.tag ? `"${f.text}" → genre ${h.tag.name}` : `"${f.text}" not found`),
       );
-      looked.set(key, { entity });
+      looked.set(key, hit ?? {});
     }
   });
+  const defaultYouth = state.request.defaultBirthYear ? youthYears(state.request.defaultBirthYear) : undefined;
 
   let matched = 0;
   let missing = 0;
@@ -261,6 +287,7 @@ export async function resolveResidents(state: PipelineState, qloo: QlooClient, t
     const signals = new Map<MediaDomain, string[]>();
     const favorites: ResolvedFavorite[] = [];
     const foodTags: string[] = [];
+    const genreTags = new Map<MediaDomain, string[]>();
     const warnings: string[] = [];
     for (const f of r.favorites) {
       const hit = looked.get(keyOf(f));
@@ -277,7 +304,12 @@ export async function resolveResidents(state: PipelineState, qloo: QlooClient, t
         if (domainsInWeek(state).has(d)) addCandidate(state, hit.entity, d, "favorite").ownedBy.add(r.id);
       } else if (hit?.tag) {
         matched++;
-        if (!foodTags.includes(hit.tag.id)) foodTags.push(hit.tag.id);
+        const d = kindToDomain(f.kind) as MediaDomain | undefined;
+        const list = d ? (genreTags.get(d) ?? []) : foodTags;
+        if (!list.includes(hit.tag.id)) list.push(hit.tag.id);
+        if (d) genreTags.set(d, list);
+        // Explainability can cite a genre signal by tag id ("their love of Westerns").
+        if (d) state.names.set(hit.tag.id, hit.tag.name);
         favorites.push({ kind: f.kind, text: f.text, status: "matched", tag: hit.tag });
       } else {
         missing++;
@@ -295,14 +327,19 @@ export async function resolveResidents(state: PipelineState, qloo: QlooClient, t
       }
     }
     const allSignals = [...new Set([...signals.values()].flat())];
-    const scorable = allSignals.length > 0 || foodTags.length > 0;
+    const allGenreTags = [...new Set([...genreTags.values()].flat())];
+    const scorable = allSignals.length > 0 || foodTags.length > 0 || allGenreTags.length > 0;
     if (!scorable) warnings.push("None of this resident's favorites matched on Qloo, so they could not be scored. Add a few more.");
+    const youth = r.birthYear ? youthYears(r.birthYear) : defaultYouth;
     state.residents.set(r.id, {
       id: r.id,
       favorites,
       signals,
       allSignals,
       foodTags,
+      genreTags,
+      allGenreTags,
+      ...(youth ? { youth } : {}),
       declined: new Set(r.declined ?? []),
       loved: new Set(r.loved ?? []),
       scorable,
@@ -339,37 +376,125 @@ function crossSignals(state: PipelineState): string[] {
   return [...counts.entries()].sort((a, b) => b[1] - a[1]).map(([id]) => id);
 }
 
-export async function buildCandidates(state: PipelineState, qloo: QlooClient, tracer: Tracer): Promise<string> {
-  const domains = [...domainsInWeek(state)];
-  const lines: string[] = [];
+/** Genre tag ids for a domain across the group, most-shared first. */
+function groupGenreTags(state: PipelineState, domain: MediaDomain): string[] {
+  const counts = new Map<string, number>();
+  for (const r of state.residents.values()) for (const id of r.genreTags.get(domain) ?? []) counts.set(id, (counts.get(id) ?? 0) + 1);
+  return [...counts.entries()].sort((a, b) => b[1] - a[1]).map(([id]) => id);
+}
+
+function crossGenreTags(state: PipelineState): string[] {
+  const counts = new Map<string, number>();
+  for (const r of state.residents.values()) for (const id of r.allGenreTags) counts.set(id, (counts.get(id) ?? 0) + 1);
+  return [...counts.entries()].sort((a, b) => b[1] - a[1]).map(([id]) => id);
+}
+
+/**
+ * The group's shared youth window: the median resident's teens-and-twenties years. A median keeps
+ * one much older or younger resident from shifting the window for everyone.
+ */
+export function groupYouth(rs: Iterable<ResidentState>): YearRange | undefined {
+  const ranges = [...rs].map((r) => r.youth).filter((y): y is YearRange => !!y).sort((a, b) => a.from - b.from);
+  return ranges[Math.floor((ranges.length - 1) / 2)];
+}
+
+/**
+ * Reminiscence bump: an extra, era-filtered query for film and TV, added alongside the taste query
+ * (never replacing it) so the pool keeps its breadth. If Qloo rejects or ignores the filter, the
+ * regular pool still stands and a note says so.
+ */
+async function eraCandidates(
+  state: PipelineState,
+  qloo: QlooClient,
+  tracer: Tracer,
+  domain: MediaDomain,
+  signals: string[],
+  tags: string[],
+  take: number,
+  residents: Iterable<ResidentState> = state.residents.values(),
+  source: CandidateSource = "group",
+): Promise<number> {
+  const years = ERA_DOMAINS.has(domain) ? groupYouth(residents) : undefined;
+  if (!years) return 0;
+  const exclude = [...new Set([...state.exclude, ...state.candidates.keys()])].slice(0, 50);
+  const res = await tracer.tryCall(
+    "get_era_recommendations",
+    { domain, years: `${years.from}-${years.to}`, signals: signals.length, take },
+    () => counted(state, qloo.insights(recommendParams(domain, signals, { take, exclude, tags, years }))),
+    (r) => `${r.length} ${domain} titles from ${years.from}-${years.to}${r[0] ? `, top: ${r[0].name}` : ""}`,
+  );
+  if (!res) {
+    state.notes.push(`Qloo did not return ${domain} titles for the residents' youth (${years.from}-${years.to}); the pool uses taste alone.`);
+    return 0;
+  }
+  let added = 0;
+  // Only keep titles Qloo dates inside the window, in case the filter is ever silently ignored.
+  for (const e of res) {
+    if (!inYears(e, years) || state.candidates.has(e.entity_id) || state.exclude.has(e.entity_id) || !suitableForGroup(e)) continue;
+    addCandidate(state, e, domain, source);
+    added++;
+  }
+  return added;
+}
+
+/** Bounds for agent-chosen pool sizes (Qloo budget and optimizer time). */
+export const POOL_TAKE_MIN = 5;
+export const POOL_TAKE_MAX = 40;
+
+export interface CandidateOptions {
+  /** Session types to fetch (default: every type in the week). Types already fetched at this size or larger are skipped. */
+  domains?: Domain[];
+  /** Pool size per session type (default GROUP_TAKE, OUTING_TAKE for outings). */
+  take?: number;
+}
+
+/** Session types in the week whose group pool has not been fetched yet. */
+export const unfetchedDomains = (state: PipelineState): Domain[] => [...domainsInWeek(state)].filter((d) => !state.fetched.has(d));
+
+export async function buildCandidates(state: PipelineState, qloo: QlooClient, tracer: Tracer, opts: CandidateOptions = {}): Promise<string> {
+  const week = domainsInWeek(state);
+  const asked = opts.domains?.length ? [...new Set(opts.domains)] : [...week];
+  const notInWeek = asked.filter((d) => !week.has(d));
+  const take = (d: Domain) => Math.max(POOL_TAKE_MIN, Math.min(POOL_TAKE_MAX, opts.take ?? (d === "outing" ? OUTING_TAKE : GROUP_TAKE)));
+  const domains = asked.filter((d) => week.has(d) && (state.fetched.get(d) ?? -1) < take(d));
+  const skipped = asked.filter((d) => week.has(d) && !domains.includes(d));
   await mapLimit(domains, CONCURRENCY, async (domain) => {
+    state.fetched.set(domain, take(domain));
     if (domain === "outing") {
-      lines.push(await outingCandidates(state, qloo, tracer));
+      await outingCandidates(state, qloo, tracer, take(domain));
       return;
     }
     // Same-domain signals when we have them, otherwise cross-domain taste (e.g. music fans -> films).
-    const same = groupSignals(state, domain);
-    const signals = same.length ? same : crossSignals(state);
-    if (!signals.length) {
+    const sameIds = groupSignals(state, domain);
+    const sameTags = groupGenreTags(state, domain);
+    const same = sameIds.length || sameTags.length;
+    const signals = same ? sameIds : crossSignals(state);
+    const tags = same ? sameTags : crossGenreTags(state);
+    if (!signals.length && !tags.length) {
       state.notes.push(`No ${domain} signals for this group; only the baseline list can fill ${domain} slots.`);
       return;
     }
     const exclude = [...state.exclude];
     const res = await tracer.tryCall(
       "get_recommendations",
-      { domain, signals: signals.length, take: GROUP_TAKE },
-      () => counted(state, qloo.insights(recommendParams(domain, signals, { exclude, city: state.request.homeCity }))),
+      { domain, signals: signals.length, ...(tags.length ? { genres: tags.length } : {}), take: take(domain) },
+      () => counted(state, qloo.insights(recommendParams(domain, signals, { take: take(domain), exclude, city: state.request.homeCity, tags }))),
       (r) => `${r.length} ${domain} candidates${r[0] ? `, top: ${r[0].name}` : ""}`,
     );
     for (const e of res ?? []) if (suitableForGroup(e)) addCandidate(state, e, domain, "group");
-    lines.push(`${domain}: ${res?.length ?? 0}`);
+    await eraCandidates(state, qloo, tracer, domain, signals, tags, Math.max(POOL_TAKE_MIN, Math.ceil(take(domain) / 2)));
   });
   const pool = [...state.candidates.values()];
-  const byDomain = domains.map((d) => `${d} ${pool.filter((c) => c.domain === d).length}`).join(", ");
-  return `Candidate pool: ${byDomain}`;
+  const byDomain = [...week].map((d) => `${d} ${pool.filter((c) => c.domain === d).length}`).join(", ");
+  const extra = [
+    skipped.length ? `already fetched: ${skipped.join(", ")}` : "",
+    notInWeek.length ? `not in this week: ${notInWeek.join(", ")}` : "",
+    unfetchedDomains(state).length ? `still unfetched: ${unfetchedDomains(state).join(", ")}` : "",
+  ].filter(Boolean);
+  return `Candidate pool: ${byDomain}${extra.length ? ` (${extra.join("; ")})` : ""}`;
 }
 
-async function outingCandidates(state: PipelineState, qloo: QlooClient, tracer: Tracer): Promise<string> {
+async function outingCandidates(state: PipelineState, qloo: QlooClient, tracer: Tracer, take = OUTING_TAKE): Promise<string> {
   const signals = crossSignals(state);
   const tags = [...new Set([...state.residents.values()].flatMap((r) => r.foodTags))];
   if (!signals.length && !tags.length) {
@@ -378,8 +503,8 @@ async function outingCandidates(state: PipelineState, qloo: QlooClient, tracer: 
   }
   const res = await tracer.tryCall(
     "get_outing_venues",
-    { city: state.request.homeCity, signals: signals.length, tags: tags.length },
-    () => counted(state, qloo.insights(outingParams(state.request.homeCity, signals, tags))),
+    { city: state.request.homeCity, signals: signals.length, tags: tags.length, take },
+    () => counted(state, qloo.insights({ ...outingParams(state.request.homeCity, signals, tags), take })),
     (r) => `${r.length} venues in ${state.request.homeCity}${r[0] ? `, top: ${r[0].name}` : ""}`,
   );
   if (!res?.length) state.notes.push(`Qloo returned no outing venues for ${state.request.homeCity}.`);
@@ -397,7 +522,9 @@ export async function expandForResidents(
   tracer: Tracer,
   residentIds: string[],
   domain: Domain,
+  take = 15,
 ): Promise<string> {
+  take = Math.max(POOL_TAKE_MIN, Math.min(POOL_TAKE_MAX, take));
   const ids = residentIds.filter((id) => state.residents.get(id)?.scorable);
   if (!ids.length) return "No scorable residents in that list.";
   if (!domainsInWeek(state).has(domain)) return `This week has no ${domain} sessions.`;
@@ -407,8 +534,8 @@ export async function expandForResidents(
     const tags = [...new Set(rs.flatMap((r) => r.foodTags))];
     const res = await tracer.tryCall(
       "get_outing_venues",
-      { city: state.request.homeCity, residents: ids.length },
-      () => counted(state, qloo.insights(outingParams(state.request.homeCity, sig, tags))),
+      { city: state.request.homeCity, residents: ids.length, take },
+      () => counted(state, qloo.insights({ ...outingParams(state.request.homeCity, sig, tags), take })),
       (r) => `${r.length} venues`,
     );
     let added = 0;
@@ -420,14 +547,17 @@ export async function expandForResidents(
     return `${added} new outing venues added for ${ids.join(", ")}`;
   }
   const rs = ids.map((id) => state.residents.get(id)!);
-  const same = [...new Set(rs.flatMap((r) => r.signals.get(domain) ?? []))];
-  const signals = same.length ? same : [...new Set(rs.flatMap((r) => r.allSignals))];
-  if (!signals.length) return "Those residents have no entity favorites to use as a signal.";
+  const sameIds = [...new Set(rs.flatMap((r) => r.signals.get(domain) ?? []))];
+  const sameTags = [...new Set(rs.flatMap((r) => r.genreTags.get(domain) ?? []))];
+  const same = sameIds.length || sameTags.length;
+  const signals = same ? sameIds : [...new Set(rs.flatMap((r) => r.allSignals))];
+  const tags = same ? sameTags : [...new Set(rs.flatMap((r) => r.allGenreTags))];
+  if (!signals.length && !tags.length) return "Those residents have no entity or genre favorites to use as a signal.";
   const exclude = [...new Set([...state.exclude, ...state.candidates.keys()])].slice(0, 50);
   const res = await tracer.tryCall(
     "get_recommendations",
-    { domain, residents: ids, signals: signals.length, take: 15 },
-    () => counted(state, qloo.insights(recommendParams(domain, signals, { take: 15, exclude, city: state.request.homeCity }))),
+    { domain, residents: ids, signals: signals.length, ...(tags.length ? { genres: tags.length } : {}), take },
+    () => counted(state, qloo.insights(recommendParams(domain, signals, { take, exclude, city: state.request.homeCity, tags }))),
     (r) => `${r.length} ${domain} candidates for ${ids.join(", ")}`,
   );
   let added = 0;
@@ -436,7 +566,9 @@ export async function expandForResidents(
     addCandidate(state, e, domain, "expanded");
     added++;
   }
-  return `${added} new ${domain} candidates aimed at ${ids.join(", ")}`;
+  // Titles from these residents' youth, for film and TV.
+  const era = await eraCandidates(state, qloo, tracer, domain, signals, tags, Math.max(POOL_TAKE_MIN, Math.ceil(take / 2)), rs, "expanded");
+  return `${added + era} new ${domain} candidates aimed at ${ids.join(", ")}${era ? ` (${era} from their youth)` : ""}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -461,6 +593,21 @@ export async function scoreAll(state: PipelineState, qloo: QlooClient, tracer: T
     if (done) ok++;
   });
   return `Scored ${ok} of ${jobs.length} resident × session-type combinations on Qloo`;
+}
+
+/** Affinity added to titles from a resident's youth before ranking: enough to break near-ties, not to outrank clear taste. */
+export const YOUTH_BOOST = 0.03;
+
+/**
+ * Soft reminiscence bump for film and TV: titles released in the resident's teens and twenties
+ * rank a little higher among this week's options. Titles Qloo gives no year are left as they are.
+ */
+function eraBoosted(state: PipelineState, r: ResidentState, domain: Domain, scored: QlooEntity[]): QlooEntity[] {
+  if (!r.youth || domain === "outing" || !ERA_DOMAINS.has(domain)) return scored;
+  return scored.map((e) => {
+    const year = state.candidates.get(e.entity_id)?.entity ?? e;
+    return typeof e.affinity === "number" && (inYears(year, r.youth) || inYears(e, r.youth)) ? { ...e, affinity: e.affinity + YOUTH_BOOST } : e;
+  });
 }
 
 async function scoreResident(
@@ -493,9 +640,12 @@ async function scoreResident(
       res = parts;
     }
   } else {
-    const same = r.signals.get(domain) ?? [];
-    const signals = same.length ? same : r.allSignals;
-    if (!signals.length) return false;
+    const sameIds = r.signals.get(domain) ?? [];
+    const sameTags = r.genreTags.get(domain) ?? [];
+    const sameDomain = sameIds.length > 0 || sameTags.length > 0;
+    const signals = sameDomain ? sameIds : r.allSignals;
+    const tags = sameDomain ? sameTags : r.allGenreTags;
+    if (!signals.length && !tags.length) return false;
     // Qloo will not score an entity against itself as a signal; owned favorites get fit 1 anyway.
     const targets = ids.filter((id) => !signals.includes(id));
     if (!targets.length) return true;
@@ -507,9 +657,9 @@ async function scoreResident(
     for (const chunk of chunks) {
       const part = await tracer.tryCall(
         "score_resident",
-        { resident: r.id, domain, candidates: chunk.length, crossDomain: !same.length },
-        () => counted(state, qloo.insights(scoreParams(domain, signals, chunk))),
-        (x) => `${r.id}: ${x.length} ${domain} candidates scored${same.length ? "" : " (cross-domain)"}`,
+        { resident: r.id, domain, candidates: chunk.length, crossDomain: !sameDomain, ...(tags.length ? { genres: tags.length } : {}) },
+        () => counted(state, qloo.insights(scoreParams(domain, signals, chunk, tags))),
+        (x) => `${r.id}: ${x.length} ${domain} candidates scored${sameDomain ? "" : " (cross-domain)"}`,
       );
       if (!part) {
         res = undefined;
@@ -524,7 +674,7 @@ async function scoreResident(
     r.warnings.push(`Qloo scoring failed for ${domain}.`);
     return false;
   }
-  const fits = rankFits(res);
+  const fits = rankFits(eraBoosted(state, r, domain, res));
   for (const e of res) {
     const c = state.candidates.get(e.entity_id);
     if (!c) continue;
@@ -659,15 +809,200 @@ function baselineMetrics(state: PipelineState) {
 export function runOptimizer(state: PipelineState): { metrics: Metrics; unreached: string[] } {
   const residents = scoredResidents(state);
   const candidates = engineCandidates(state);
-  const input = { slots: state.slots, candidates, residents, locked: state.locked, exclude: state.exclude };
+  // Agent pins act like locks (edit-mode locks win); agent week bans act like exclusions.
+  const locked = new Map([...state.pins, ...state.locked]);
+  const exclude = new Set([...state.exclude, ...state.weekBans]);
+  const input = { slots: state.slots, candidates, residents, locked, exclude, slotBans: state.slotBans };
   // Seeding with the baselines guarantees the result is never worse than a baseline on the same pool.
+  // The current schedule wins ties, so re-runs keep picks (and the briefs written for them) unless the
+  // objective improves.
   const seeds = [...state.baselineAssignments.values()];
-  if (state.assignment) seeds.push(state.assignment);
-  const res = optimizeBest(input, seeds);
+  const res = optimizeBest(input, seeds, state.assignment ?? undefined);
   state.assignment = res.bySlot;
   state.metrics = metricsWithDiscovery(state, res.bySlot);
   state.optimizerRuns++;
   return { metrics: state.metrics, unreached: unreached(res, input) };
+}
+
+// ---------------------------------------------------------------------------
+// Step 5b: self-critique (inspect) and agent revisions
+// ---------------------------------------------------------------------------
+
+/** Fit below this for every attendee marks a slot as weak. */
+const LOW_SLOT_FIT = 0.5;
+const normTitle = (s: string) =>
+  s
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[̀-ͯ]/g, "")
+    .replace(/\(.*?\)/g, " ")
+    .replace(/^the\s+/, "")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+
+/**
+ * Compact diagnostics of the current schedule for the agent's self-critique. Every number comes
+ * from Qloo fits and the optimizer; candidate ids are the only handles revise_plan accepts.
+ */
+export function inspectPlan(state: PipelineState) {
+  if (!state.assignment || !state.metrics) throw new Error("Run the optimizer first.");
+  const assignment = state.assignment;
+  const cands = engineCandidates(state);
+  const candMap = new Map(cands.map((c) => [c.id, c]));
+  const residents = scoredResidents(state);
+  const slotReq = new Map(state.request.slots.map((s) => [s.id, s]));
+  const used = new Set(assignment.values());
+  const blockedWeek = new Set([...state.exclude, ...state.weekBans]);
+
+  const best = residents
+    .map((r) => ({ resident: r, ...bestFor(r, assignment, state.slots, candMap) }))
+    .sort((a, b) => a.fit - b.fit);
+  // For the weakest residents: unused pool items they would love, and which slots could take them.
+  const weakest = best.slice(0, 5).map((b) => {
+    const options = cands
+      .filter((c) => !used.has(c.id) && !blockedWeek.has(c.id) && fitOf(c, b.resident) >= REACH_THRESHOLD)
+      .map((c) => ({
+        c,
+        fit: fitOf(c, b.resident),
+        slots: state.slots
+          .filter((s) => s.domain === c.domain && s.attendees.includes(b.resident) && !state.locked.has(s.id) && !state.slotBans.get(s.id)?.has(c.id))
+          .map((s) => s.id),
+      }))
+      .filter((o) => o.slots.length)
+      .sort((x, y) => y.fit - x.fit)
+      .slice(0, 3)
+      .map((o) => ({ candidate_id: o.c.id, name: clip(state.names.get(o.c.id) ?? o.c.id, 60), type: o.c.domain, fit: o.fit, fits_slots: o.slots }));
+    return { resident: b.resident, best_fit: b.fit, best_slot: b.slotId ?? null, unused_strong_options: options };
+  });
+
+  const slots = state.slots.map((s) => {
+    const cid = assignment.get(s.id);
+    const ec = cid ? candMap.get(cid) : undefined;
+    const fits = ec ? s.attendees.filter((r) => residents.includes(r)).map((r) => fitOf(ec, r)) : [];
+    const mean = fits.length ? round3(fits.reduce((a, b) => a + b, 0) / fits.length) : 0;
+    return {
+      slot: s.id,
+      type: s.domain,
+      candidate_id: cid ?? null,
+      pick: cid ? clip(state.names.get(cid) ?? cid, 60) : null,
+      strong_matches: fits.filter((f) => f >= REACH_THRESHOLD - 1e-9).length,
+      mean_fit: mean,
+      max_fit: fits.length ? Math.max(...fits) : 0,
+      pinned: state.pins.has(s.id) || state.locked.has(s.id),
+    };
+  });
+  const lowFit = slots.filter((s) => !s.pick || s.strong_matches === 0 || s.max_fit < LOW_SLOT_FIT).map((s) => s.slot);
+
+  // Near-duplicates: titles that normalize to the same words, or one contains the other.
+  const picked = slots.filter((s) => s.candidate_id).map((s) => ({ slot: s.slot, n: normTitle(state.names.get(s.candidate_id!) ?? "") }));
+  const duplicates: string[][] = [];
+  for (let i = 0; i < picked.length; i++) {
+    for (let j = i + 1; j < picked.length; j++) {
+      const a = picked[i]!.n;
+      const b = picked[j]!.n;
+      if (a && b && (a === b || (Math.min(a.length, b.length) >= 4 && (a.includes(b) || b.includes(a))))) duplicates.push([picked[i]!.slot, picked[j]!.slot]);
+    }
+  }
+  // Over-representation: one origin dominating (e.g. half the week is residents' own favorites), or
+  // one session type taking more than half the week.
+  const bySource = new Map<string, number>();
+  const byType = new Map<string, number>();
+  for (const cid of assignment.values()) {
+    const c = state.candidates.get(cid);
+    if (!c) continue;
+    bySource.set(c.source, (bySource.get(c.source) ?? 0) + 1);
+    byType.set(c.domain, (byType.get(c.domain) ?? 0) + 1);
+  }
+  const half = Math.max(2, Math.ceil(assignment.size / 2));
+  const overRepresented = [
+    ...[...byType.entries()].filter(([, n]) => n > half).map(([t, n]) => `type ${t}: ${n} of ${assignment.size} sessions`),
+    ...[...bySource.entries()].filter(([, n]) => n > half).map(([s, n]) => `source ${s}: ${n} of ${assignment.size} sessions`),
+  ];
+
+  const baselines = baselineMetrics(state)
+    .filter((b) => b.metrics)
+    .map((b) => ({ key: b.key, reached: b.metrics!.reached, min_fit: b.metrics!.minBest, reach_gain: state.metrics!.reached - b.metrics!.reached }));
+
+  return {
+    metrics: state.metrics,
+    resident_best_fit: Object.fromEntries(best.map((b) => [b.resident, b.fit])),
+    weakest,
+    low_fit_slots: lowFit,
+    slots,
+    near_duplicates: duplicates,
+    over_represented: overRepresented,
+    unfetched_types: unfetchedDomains(state),
+    baselines,
+    revisions: { pins: Object.fromEntries(state.pins), week_excluded: [...state.weekBans], slot_excluded: Object.fromEntries([...state.slotBans].map(([k, v]) => [k, [...v]])) },
+  };
+}
+
+const round3 = (n: number) => Math.round(n * 1000) / 1000;
+
+export interface Revision {
+  exclude?: { candidate_id: string; slot_id?: string | null }[];
+  pin?: { slot_id: string; candidate_id: string }[];
+  unpin?: string[];
+}
+
+/**
+ * Applies an agent revision and re-runs the optimizer. Only candidates Qloo returned (already in the
+ * pool) can be referenced; attendance, opt-outs, declines and edit-mode locks stay enforced by the
+ * optimizer. Validates everything before changing state, so a rejected revision changes nothing.
+ */
+export function revisePlan(state: PipelineState, rev: Revision): { before: Metrics; metrics: Metrics; unreached: string[]; changed: string[] } {
+  if (!state.assignment || !state.metrics) throw new Error("Run the optimizer first.");
+  const slotById = new Map(state.slots.map((s) => [s.id, s]));
+  const problems: string[] = [];
+  const known = (id: string) => state.candidates.has(id);
+  for (const x of rev.exclude ?? []) {
+    if (!known(x.candidate_id)) problems.push(`${x.candidate_id} is not in the candidate pool`);
+    if (x.slot_id && !slotById.has(x.slot_id)) problems.push(`slot ${x.slot_id} does not exist`);
+    const lockedHere = [...state.locked.entries()].some(([s, c]) => c === x.candidate_id && (!x.slot_id || s === x.slot_id));
+    if (lockedHere) problems.push(`${x.candidate_id} is kept by the coordinator and cannot be excluded`);
+  }
+  const pinIds = new Set<string>();
+  for (const p of rev.pin ?? []) {
+    const slot = slotById.get(p.slot_id);
+    const c = state.candidates.get(p.candidate_id);
+    if (!slot) problems.push(`slot ${p.slot_id} does not exist`);
+    if (!c) problems.push(`${p.candidate_id} is not in the candidate pool`);
+    if (!slot || !c) continue;
+    if (c.domain !== slot.domain) problems.push(`${p.candidate_id} is ${c.domain}, slot ${p.slot_id} is ${slot.domain}`);
+    if (state.locked.has(p.slot_id)) problems.push(`slot ${p.slot_id} is kept by the coordinator`);
+    if (state.exclude.has(p.candidate_id)) problems.push(`${p.candidate_id} was shown last week and is excluded`);
+    const excludedNow = (rev.exclude ?? []).some((x) => x.candidate_id === p.candidate_id && (!x.slot_id || x.slot_id === p.slot_id));
+    if (state.weekBans.has(p.candidate_id) || state.slotBans.get(p.slot_id)?.has(p.candidate_id) || excludedNow) problems.push(`${p.candidate_id} is excluded from ${p.slot_id}`);
+    if (pinIds.has(p.candidate_id)) problems.push(`${p.candidate_id} is pinned twice`);
+    pinIds.add(p.candidate_id);
+  }
+  const pinSlots = (rev.pin ?? []).map((p) => p.slot_id);
+  if (new Set(pinSlots).size !== pinSlots.length) problems.push("a slot is pinned twice");
+  if (problems.length) throw new Error(`Revision rejected, nothing changed: ${[...new Set(problems)].join("; ")}.`);
+
+  const before = state.metrics;
+  const prev = new Map(state.assignment);
+  for (const s of rev.unpin ?? []) state.pins.delete(s);
+  for (const x of rev.exclude ?? []) {
+    if (x.slot_id) {
+      const set = state.slotBans.get(x.slot_id) ?? new Set<string>();
+      set.add(x.candidate_id);
+      state.slotBans.set(x.slot_id, set);
+      if (state.pins.get(x.slot_id) === x.candidate_id) state.pins.delete(x.slot_id);
+    } else {
+      state.weekBans.add(x.candidate_id);
+      for (const [s, c] of state.pins) if (c === x.candidate_id) state.pins.delete(s);
+    }
+  }
+  for (const p of rev.pin ?? []) {
+    // A candidate can only be in one slot: move an earlier pin of it.
+    for (const [s, c] of state.pins) if (c === p.candidate_id) state.pins.delete(s);
+    state.pins.set(p.slot_id, p.candidate_id);
+  }
+  // The old assignment still seeds the search; the optimizer drops seeded picks that are now banned.
+  const { metrics, unreached } = runOptimizer(state);
+  const changed = state.slots.filter((s) => prev.get(s.id) !== state.assignment!.get(s.id)).map((s) => s.id);
+  return { before, metrics, unreached, changed };
 }
 
 // ---------------------------------------------------------------------------
@@ -706,11 +1041,15 @@ export async function buildOneToOnes(state: PipelineState, qloo: QlooClient, tra
     const domains = DOMAINS.filter((d): d is MediaDomain => d !== "outing");
     for (const d of domains) {
       const sig = r.signals.get(d) ?? [];
-      if (!sig.length) continue;
+      const tags = r.genreTags.get(d) ?? [];
+      if (!sig.length && !tags.length) continue;
+      // A genre alone ("westerns") gives Qloo little to go on and returns recent titles (checked
+      // live); their youth years anchor it to the films they grew up with (film and TV only).
+      const years = sig.length || !r.youth ? undefined : r.youth;
       const res = await tracer.tryCall(
         "get_one_to_one",
         { resident: id, domain: d },
-        () => counted(state, qloo.insights(recommendParams(d, sig, { take: 4, exclude: sig, explain: true }))),
+        () => counted(state, qloo.insights(recommendParams(d, sig, { take: 4, exclude: sig, explain: true, tags, ...(years ? { years } : {}) }))),
         (x) => `${x.length} ${d} picks for ${id}`,
       );
       for (const e of (res ?? []).filter((e) => !r.declined.has(e.entity_id)).slice(0, 2)) {
@@ -745,8 +1084,22 @@ export function whyFor(state: PipelineState, c: CandidateState, residentId: stri
     .map((x) => state.names.get(x.entity_id)!);
   const fit = c.fit.get(residentId) ?? 0;
   const rank = `Top ${Math.max(1, Math.round((1 - fit) * 100))}% of this week's options for them`;
-  return ex.length ? `${rank}; Qloo links it to their love of ${ex.join(" and ")}.` : `${rank} on Qloo taste affinity.`;
+  const why = ex.length ? `${rank}; Qloo links it to their love of ${ex.join(" and ")}.` : `${rank} on Qloo taste affinity.`;
+  const era = youthNote(state, c, residentId);
+  return era ? `${why} ${era}` : why;
 }
+
+/** "Released in 1958, from their teens." when a film or TV pick falls in the resident's youth window. */
+export function youthNote(state: PipelineState, c: CandidateState, residentId: string): string | undefined {
+  const r = state.residents.get(residentId);
+  if (c.domain === "outing" || !ERA_DOMAINS.has(c.domain) || !inYears(c.entity, r?.youth)) return undefined;
+  const year = c.entity.properties!.release_year!;
+  const age = year - (r!.youth!.from - youthYears(0).from);
+  return `Released in ${year}, from their ${age < 20 ? "teens" : age < 30 ? "twenties" : "youth"}.`;
+}
+
+/** True when the candidate is a film or TV title from the resident's youth window. */
+const fromYouth = (state: PipelineState, c: CandidateState, residentId: string) => !!youthNote(state, c, residentId);
 
 // ---------------------------------------------------------------------------
 // Snapshot for the agent (compact, ids are aliases)
@@ -768,8 +1121,14 @@ export function snapshot(state: PipelineState) {
         when: `${slotReq.get(s.id)?.day} ${slotReq.get(s.id)?.time}`,
         type: s.domain,
         pick: c ? clip(c.entity.name, 60) : null,
+        candidate_id: cid ?? null,
         attendees: s.attendees.length,
         strong_matches: matches,
+        // Attendees for whom the pick was released in their teens or twenties (film and TV).
+        ...(() => {
+          const ids = c ? s.attendees.filter((r) => fromYouth(state, c, r)) : [];
+          return ids.length ? { year: c!.entity.properties?.release_year, from_youth_of: ids } : {};
+        })(),
       };
     }),
     unreached: state.assignment && state.metrics
@@ -777,6 +1136,7 @@ export function snapshot(state: PipelineState) {
       : [],
     unscorable: [...state.residents.values()].filter((r) => !r.scorable).map((r) => r.id),
     pool: Object.fromEntries([...domainsInWeek(state)].map((d) => [d, cands.filter((c) => c.domain === d).length])),
+    unfetched_types: unfetchedDomains(state),
     baselines: baselineMetrics(state).map((b) => ({ key: b.key, metrics: b.metrics ?? null })),
   };
 }
@@ -830,7 +1190,13 @@ export function buildPlan(state: PipelineState, now: Date = new Date()): WeekPla
     const ec = candMap.get(c.entity.entity_id)!;
     const fits = s.attendees.map((r) => fitOf(ec, r));
     const matches: SessionMatch[] = s.attendees
-      .map((r) => ({ residentId: r, fit: fitOf(ec, r), ownFavorite: c.ownedBy.has(r), why: whyFor(state, c, r) }))
+      .map((r) => ({
+        residentId: r,
+        fit: fitOf(ec, r),
+        ownFavorite: c.ownedBy.has(r),
+        why: whyFor(state, c, r),
+        ...(fromYouth(state, c, r) ? { fromYouth: true } : {}),
+      }))
       .filter((m) => m.ownFavorite || m.fit >= REACH_THRESHOLD)
       .sort((a, b) => b.fit - a.fit);
     sessions.push({
@@ -862,7 +1228,13 @@ export function buildPlan(state: PipelineState, now: Date = new Date()): WeekPla
       .map((s) => {
         const c = state.candidates.get(state.assignment!.get(s.id)!)!;
         const ec = candMap.get(c.entity.entity_id)!;
-        return { slotId: s.id, fit: fitOf(ec, r.id), ownFavorite: c.ownedBy.has(r.id), why: whyFor(state, c, r.id) };
+        return {
+          slotId: s.id,
+          fit: fitOf(ec, r.id),
+          ownFavorite: c.ownedBy.has(r.id),
+          why: whyFor(state, c, r.id),
+          ...(fromYouth(state, c, r.id) ? { fromYouth: true } : {}),
+        };
       })
       .sort((a, b) => b.fit - a.fit);
     const best = bestFor(r.id, state.assignment!, state.slots, candMap);
@@ -875,6 +1247,7 @@ export function buildPlan(state: PipelineState, now: Date = new Date()): WeekPla
       ...(best.slotId ? { bestSlotId: best.slotId } : {}),
       sessions: list,
       favorites: r.favorites,
+      ...(r.youth ? { youthYears: r.youth } : {}),
       careNote: "",
       warnings: [...r.warnings],
     };
@@ -918,16 +1291,19 @@ function templateBrief(state: PipelineState, c: CandidateState, strong: number, 
 
 function careNote(state: PipelineState, o: ResidentOutcome, reqSlots: Map<string, PlanRequest["slots"][number]>): string {
   if (!o.scorable) return "Preferences not yet matched on Qloo; record more specific favorites (artists, films, shows) at next review.";
-  const favs = o.favorites.filter((f) => f.status === "matched").map((f) => f.entity?.name ?? f.tag?.name);
+  const favs = o.favorites.filter((f) => f.status === "matched").map((f) => f.entity?.name ?? f.tag?.name)
+    .filter((n): n is string => !!n);
   const top = o.sessions.filter((s) => s.ownFavorite || s.fit >= REACH_THRESHOLD).slice(0, 3);
   const when = top
     .map((s) => {
-      const r = reqSlots.get(s.slotId)!;
+      const r = reqSlots.get(s.slotId);
       const c = state.candidates.get(state.assignment!.get(s.slotId)!);
-      return `${c?.entity.name} (${DAY_NAMES[r.day]} ${r.time})`;
+      if (!r || !c?.entity.name) return "";
+      return `${c.entity.name} (${DAY_NAMES[r.day]} ${r.time})`;
     })
+    .filter(Boolean)
     .join("; ");
-  const parts = [`Documented preferences: ${favs.slice(0, 5).join(", ")}.`];
+  const parts = [favs.length ? `Documented preferences: ${favs.slice(0, 5).join(", ")}.` : "Preferences matched on Qloo via related tastes."];
   parts.push(when ? `Invited to sessions matched to these preferences: ${when}.` : "No group session this week closely matches these preferences.");
   if (o.oneToOne) parts.push(`1:1 visit planned with ${o.oneToOne.picks.slice(0, 3).map((p) => p.name).join(", ")}.`);
   return parts.join(" ");

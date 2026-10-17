@@ -2,6 +2,7 @@
 import { createHash } from "node:crypto";
 import { mkdir, readFile, writeFile, rename } from "node:fs/promises";
 import { join } from "node:path";
+import { pruneJsonDir } from "../plans-store.ts";
 
 export interface QlooCache {
   get(key: string): Promise<unknown | undefined>;
@@ -16,11 +17,24 @@ interface Entry {
 }
 
 /** File cache: one JSON file per sha256(key) under `<dir>/qloo/`. */
-export function createFileCache(dir: string = process.env.CACHE_DIR ?? ".cache", ttlMs: number = DAY_MS): QlooCache {
+export function createFileCache(
+  dir: string = process.env.CACHE_DIR ?? ".cache",
+  ttlMs: number = DAY_MS,
+  maxFiles: number = 2000,
+): QlooCache {
   const root = join(dir, "qloo");
   let ready: Promise<unknown> | undefined;
   const ensureDir = () => (ready ??= mkdir(root, { recursive: true }));
   const fileFor = (key: string) => join(root, `${createHash("sha256").update(key).digest("hex")}.json`);
+  // Expired entries are skipped on read but would otherwise pile up on the persistent disk.
+  // Prune at most hourly (and once at boot), keeping files younger than the TTL and capping count.
+  let lastPrune = 0;
+  const maybePrune = () => {
+    const now = Date.now();
+    if (now - lastPrune < 60 * 60 * 1000) return;
+    lastPrune = now;
+    void pruneJsonDir(root, ttlMs, maxFiles, now).catch(() => {});
+  };
 
   return {
     async get(key) {
@@ -42,6 +56,7 @@ export function createFileCache(dir: string = process.env.CACHE_DIR ?? ".cache",
         const entry: Entry = { expiresAt: Date.now() + ttlMs, value };
         await writeFile(tmp, JSON.stringify(entry), "utf8");
         await rename(tmp, file);
+        maybePrune();
       } catch {
         // Cache write failures must never break a request.
         ready = undefined;

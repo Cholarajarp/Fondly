@@ -4,7 +4,7 @@ import type { AgentEvent, Metrics } from "../../../shared/types";
 /** One row in the timeline, derived by folding AgentEvents. */
 export type TimelineStep =
   | { kind: "status"; key: string; message: string }
-  | { kind: "tool"; key: string; tool: string; label: string; state: "running" | "ok" | "fail"; ms?: number; summary?: string };
+  | { kind: "tool"; key: string; tool: string; label: string; state: "running" | "ok" | "fail"; ms?: number; summary?: string; reason?: string };
 
 export interface TimelineState {
   steps: TimelineStep[];
@@ -56,6 +56,10 @@ export function toolLabel(tool: string, input: unknown): string {
       return "Running the fairness optimizer";
     case "expand_for_residents":
       return `Searching wider for ${(input as { resident_ids?: string[] })?.resident_ids?.join(", ") ?? "unreached residents"}`;
+    case "inspect_plan":
+      return "Checking the plan for weak spots";
+    case "revise_plan":
+      return "Revising the plan";
     case "plan_one_to_ones":
       return "Planning 1:1 visits";
     case "get_one_to_one":
@@ -77,7 +81,7 @@ export function applyEvent(s: TimelineState, ev: AgentEvent, seq: number): Timel
   if (ev.kind === "status") return { ...s, steps: [...s.steps, { kind: "status", key: `s${seq}`, message: ev.message }] };
   if (ev.kind === "progress") return { ...s, progress: [...s.progress, { label: ev.label, metrics: ev.metrics }] };
   if (ev.kind === "tool_call")
-    return { ...s, steps: [...s.steps, { kind: "tool", key: `${ev.id}-${seq}`, tool: ev.tool, label: toolLabel(ev.tool, ev.input), state: "running" }] };
+    return { ...s, steps: [...s.steps, { kind: "tool", key: `${ev.id}-${seq}`, tool: ev.tool, label: toolLabel(ev.tool, ev.input), state: "running", ...(ev.reason ? { reason: ev.reason } : {}) }] };
   if (ev.kind === "tool_result") {
     // Match the most recent running step with this id prefix.
     let idx = -1;
@@ -192,13 +196,20 @@ export function AgentTimeline({ title, timeline, running, onCancel }: Props) {
                     <span className="tl-label">{s.label}</span>
                     {s.ms !== undefined && <span className="tl-ms">{(s.ms / 1000).toFixed(1)}s</span>}
                   </div>
+                  {/* The agent's own reason is visible text (read by screen readers too), not a tooltip. */}
+                  {s.reason && (
+                    <p className="tl-reason">
+                      <span className="sr-only">Agent's reason: </span>
+                      {s.reason}
+                    </p>
+                  )}
                   {s.summary && <span className="tl-summary">{s.summary}</span>}
                 </div>
               </li>
             ),
           )}
         </ol>
-        <p className="tl-foot">Every title, venue and score comes from a live Qloo response. The schedule is chosen by a deterministic optimizer, not the language model.</p>
+        <p className="tl-foot">Every title, venue and score comes from a live Qloo response. The agent decides which steps to take and explains each one; the schedule itself is chosen by a deterministic optimizer, not the language model.</p>
       </div>
     </section>
   );

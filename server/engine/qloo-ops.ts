@@ -1,7 +1,7 @@
 // Qloo operations for Fondly. Every function returns only data Qloo actually returned.
 // Privacy: only entity ids, tag ids and public cultural names (what staff typed as a favorite)
 // are ever sent to Qloo. Resident names never leave the browser.
-import type { Domain, EntityType, FavoriteKind, QlooClient, QlooEntity, QlooTag } from "../../shared/types.ts";
+import type { Domain, EntityType, FavoriteKind, QlooClient, QlooEntity, QlooTag, YearRange } from "../../shared/types.ts";
 
 type Params = Record<string, string | number | boolean>;
 
@@ -102,6 +102,71 @@ export function pickByName<T extends { name: string }>(results: T[], text: strin
   );
 }
 
+/** Exact or prefix name match only (no "top result" fallback). */
+function nameMatch<T extends { name: string }>(results: T[], text: string): { hit: T; exact: boolean } | undefined {
+  const n = norm(text);
+  const exact = results.find((e) => norm(e.name) === n);
+  if (exact) return { hit: exact, exact: true };
+  const prefix = results.find((e) => norm(e.name).startsWith(n) || n.startsWith(norm(e.name)));
+  return prefix ? { hit: prefix, exact: false } : undefined;
+}
+
+/**
+ * Genre tag types per favorite kind (checked live: /v2/tags with filter.tag.types returns e.g.
+ * "Big Band" and "Gospel" for genre:music, "Westerns" and "Musicals" for genre:media).
+ * Sports favorites are always teams or leagues, so they never resolve to a genre.
+ */
+export const GENRE_TAG_TYPE: Partial<Record<Exclude<FavoriteKind, "food">, string>> = {
+  music: "urn:tag:genre:music",
+  film: "urn:tag:genre:media",
+  tv: "urn:tag:genre:media",
+  books: "urn:tag:genre:media",
+  gaming: "urn:tag:genre:media",
+};
+
+// Plural-tolerant, so "westerns" matches "Westerns" and "game shows" matches "Game Show".
+const singular = (s: string) => s.replace(/s\b/g, "");
+
+/**
+ * True when the text reads like a proper name ("The Beatles", "Johnny Cash") rather than a genre
+ * ("gospel", "big band", "Westerns"). A proper name keeps an exact entity match over a same-named genre.
+ */
+export const looksLikeName = (text: string): boolean => {
+  const words = text.trim().split(/\s+/).filter(Boolean);
+  return /^the\s/i.test(text.trim()) || (words.length >= 2 && words.every((w) => /^[\p{Lu}\p{N}]/u.test(w)));
+};
+
+export type FavoriteHit = { entity: QlooEntity; tag?: undefined } | { tag: QlooTag; entity?: undefined };
+
+/**
+ * Resolves a non-food favorite to a Qloo entity, or to a genre tag when the text is a genre.
+ * Qloo's entity search alone turns "big band" into "Big Band Katowice" and "gospel" into a band
+ * called Gospel, so: an exact genre tag wins over a partial entity match (and over an exact one
+ * unless the text looks like a proper name); with no name match at all, a related genre tag beats
+ * Qloo's top entity result.
+ */
+export async function resolveFavorite(qloo: QlooClient, kind: Exclude<FavoriteKind, "food">, text: string): Promise<FavoriteHit | undefined> {
+  const tagType = GENRE_TAG_TYPE[kind];
+  if (!tagType) {
+    const entity = await resolveEntity(qloo, kind, text);
+    return entity ? { entity } : undefined;
+  }
+  const res = await qloo.searchEntities(text, [KIND_TYPE[kind]], 5);
+  const named = nameMatch(res, text);
+  // A clear proper-name match needs no genre lookup (saves a Qloo call for most favorites).
+  if (named?.exact && looksLikeName(text)) return { entity: named.hit };
+  const tags = await qloo.searchTags(text, 5, [tagType]).catch(() => [] as QlooTag[]);
+  const n = singular(norm(text));
+  const exactTag = tags.find((t) => singular(norm(t.name)) === n);
+  if (exactTag) return { tag: exactTag };
+  if (named) return { entity: named.hit };
+  // No name match: a genre tag sharing a word with the text ("old westerns" -> Westerns) beats a random entity.
+  const words = new Set(n.split(" ").filter((w) => w.length > 2));
+  const related = tags.find((t) => singular(norm(t.name)).split(" ").some((w) => words.has(w)));
+  if (related) return { tag: related };
+  return res[0] ? { entity: res[0] } : undefined;
+}
+
 export async function resolveEntity(qloo: QlooClient, kind: Exclude<FavoriteKind, "food">, text: string) {
   const res = await qloo.searchEntities(text, [KIND_TYPE[kind]], 5);
   const tag = DOMAIN_TAG[kind];
@@ -118,33 +183,56 @@ export async function resolveFoodTag(qloo: QlooClient, text: string): Promise<Ql
   return pickByName(food.length ? food : res, text);
 }
 
+export const MAX_SIGNAL_TAGS = 10;
+
+/** Entity and/or genre-tag taste signals; Qloo needs at least one of the two. */
+function withSignals(p: Params, signalIds: string[], tagIds: string[] = []) {
+  if (signalIds.length) p["signal.interests.entities"] = signalIds.slice(0, MAX_SIGNAL_IDS).join(",");
+  if (tagIds.length) p["signal.interests.tags"] = tagIds.slice(0, MAX_SIGNAL_TAGS).join(",");
+}
+
+/**
+ * Session types whose Qloo entities carry release years and honor filter.release_year.* (checked
+ * live: movies and TV shows return only titles inside the window). Artists accept the filter but
+ * silently ignore it and have no release year, so music cannot be era-filtered.
+ */
+export const ERA_DOMAINS: ReadonlySet<Exclude<Domain, "outing">> = new Set(["film", "tv"]);
+
+/** True when a title's release year falls inside the window. Titles without a year never count. */
+export const inYears = (e: QlooEntity, years: YearRange | undefined): boolean => {
+  const y = e.properties?.release_year;
+  return !!years && typeof y === "number" && y >= years.from && y <= years.to;
+};
+
 /** Recommendations for a domain from a set of taste signals (group- or resident-level). */
 export function recommendParams(
   domain: Exclude<Domain, "outing">,
   signalIds: string[],
-  opts: { take?: number; exclude?: string[]; explain?: boolean; city?: string } = {},
+  opts: { take?: number; exclude?: string[]; explain?: boolean; city?: string; tags?: string[]; years?: YearRange } = {},
 ): Params {
-  const p: Params = {
-    "filter.type": DOMAIN_TYPE[domain],
-    "signal.interests.entities": signalIds.slice(0, MAX_SIGNAL_IDS).join(","),
-    take: opts.take ?? GROUP_TAKE,
-  };
+  const p: Params = { "filter.type": DOMAIN_TYPE[domain], take: opts.take ?? GROUP_TAKE };
+  withSignals(p, signalIds, opts.tags);
   if (opts.exclude?.length) p["filter.exclude.entities"] = opts.exclude.slice(0, 50).join(",");
   if (opts.explain) p["feature.explainability"] = true;
+  if (opts.years && ERA_DOMAINS.has(domain)) {
+    p["filter.release_year.min"] = opts.years.from;
+    p["filter.release_year.max"] = opts.years.to;
+  }
   withHomeTeams(domain, p, opts.city);
   return withDiscoveryTag(domain, withDomainTag(domain, p));
 }
 
-/** Score a fixed list of candidates against one resident's taste signals. */
-export function scoreParams(domain: Exclude<Domain, "outing">, signalIds: string[], candidateIds: string[]): Params {
+/** Score a fixed list of candidates against one resident's taste signals (entities and/or genre tags). */
+export function scoreParams(domain: Exclude<Domain, "outing">, signalIds: string[], candidateIds: string[], tagIds: string[] = []): Params {
   // Candidates are already domain-filtered; the tag filter is not re-applied when scoring a fixed list.
-  return {
+  const p: Params = {
     "filter.type": DOMAIN_TYPE[domain],
-    "signal.interests.entities": signalIds.slice(0, MAX_SIGNAL_IDS).join(","),
     "filter.results.entities": candidateIds.slice(0, SCORE_TAKE).join(","),
     "feature.explainability": true,
     take: Math.max(1, Math.min(candidateIds.length, SCORE_TAKE)),
   };
+  withSignals(p, signalIds, tagIds);
+  return p;
 }
 
 /** Generic "popular with older adults" list, the comparison baseline (no resident data). */

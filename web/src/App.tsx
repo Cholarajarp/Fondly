@@ -6,11 +6,27 @@ import { ErrorPanel } from "./components/ErrorPanel";
 import { Header, isHealthy, type HealthState } from "./components/Header";
 import { PlanView, type ReplanInput } from "./components/PlanView";
 import { RosterEditor } from "./components/RosterEditor";
+import { FamilyPage } from "./components/FamilyPage";
+import { parseFamilyHash, useFamilyLinks } from "./family";
 import { mergeRequest, redactNames, toRequest, useRoster } from "./roster";
 
 type Route = { name: "home" } | { name: "plan"; id: string };
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+/** Family links open a separate, minimal page that never touches the coordinator's roster. */
+export default function Root() {
+  const [family, setFamily] = useState(() => parseFamilyHash(window.location.hash));
+  useEffect(() => {
+    const onHash = () => setFamily(parseFamilyHash(window.location.hash));
+    window.addEventListener("hashchange", onHash);
+    return () => window.removeEventListener("hashchange", onHash);
+  }, []);
+  if (family) return <FamilyPage key={family.token} token={family.token} label={family.label} />;
+  if (window.location.hash.startsWith("#/family/"))
+    return <FamilyPage token="" label={undefined} />;
+  return <App />;
+}
 
 function parseHash(hash: string): Route {
   const m = /^#\/plan\/([^/?#]+)$/.exec(hash);
@@ -74,10 +90,11 @@ function Hero({ onStart, hasRoster }: { onStart: () => void; hasRoster: boolean 
   );
 }
 
-export default function App() {
+function App() {
   const [route, setRoute] = useState<Route>(() => parseHash(window.location.hash));
   const [health, setHealth] = useState<HealthState>({ state: "loading" });
   const [roster, updateRoster, resetRoster] = useRoster();
+  const familyLinks = useFamilyLinks(roster.rosterId);
   const [view, setView] = useState<View>({ name: "idle" });
   const [timeline, setTimeline] = useState<TimelineState>(emptyTimeline);
   const runRef = useRef<AbortController | null>(null);
@@ -257,6 +274,7 @@ export default function App() {
               busy={false}
               intakeEnabled={intakeEnabled}
               disabledReason={disabledReason}
+              familyLinks={familyLinks}
             />
             <section className="how" aria-label="What makes Fondly different">
               <div className="card">
