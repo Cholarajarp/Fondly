@@ -13,5 +13,7 @@ export default defineConfig({
     root: ".",
     include: ["tests/**/*.test.ts"],
     environment: "node",
+    // Tests use fakes: keep the real .env provider keys out (dotenv never overrides a set variable).
+    env: { NVIDIA_API_KEY: "", LLM_PROVIDER: "" },
   },
 });

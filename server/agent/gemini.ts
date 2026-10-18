@@ -58,15 +58,20 @@ export class AgentError extends Error {
  */
 const STICKY_MS = 10 * 60 * 1000;
 const stickyModel = new Map<string, { model: string; until: number }>();
-/** Until this time, calls go straight to NVIDIA (Gemini recently rate limited or failed). */
+/** With LLM_PROVIDER=gemini: until this time, calls go straight to NVIDIA (Gemini recently failed). */
 let nvidiaUntil = 0;
-/** Marks a conversation's first content once it has moved to NVIDIA. */
+/** Marks a conversation's first content once it is on NVIDIA. */
 const ON_NVIDIA = Symbol("onNvidia");
-type Tagged = Content & { [ON_NVIDIA]?: true };
+/** Marks a conversation that fell back from NVIDIA to Gemini, so it does not bounce back. */
+const ON_GEMINI = Symbol("onGemini");
+type Tagged = Content & { [ON_NVIDIA]?: true; [ON_GEMINI]?: true };
+/** NVIDIA models that failed recently, until when; they are tried last. */
+const nvidiaFailedUntil = new Map<string, number>();
 
 /** Test hook: forget remembered fallbacks. */
 export const resetStickyModels = () => {
   stickyModel.clear();
+  nvidiaFailedUntil.clear();
   nvidiaUntil = 0;
 };
 
@@ -76,19 +81,27 @@ type RetryOpts = { signal?: AbortSignal; deadline: number; sleep?: (ms: number, 
 async function viaNvidia(params: GenerateContentParameters, opts: RetryOpts, contents: Content[]): Promise<GenerateContentResponse> {
   if (contents[0]) (contents[0] as Tagged)[ON_NVIDIA] = true;
   let last: unknown;
-  for (const model of nvidiaModels()) {
+  // Models that failed recently go last, so each agent turn does not re-wait on a broken one.
+  const now = Date.now();
+  const models = nvidiaModels();
+  const order = [...models.filter((m) => !(nvidiaFailedUntil.get(m)! > now)), ...models.filter((m) => nvidiaFailedUntil.get(m)! > now)];
+  for (const model of order) {
     const remaining = opts.deadline - Date.now();
     if (remaining <= 500) throw new AgentError("Time budget reached");
-    const signals = [AbortSignal.timeout(Math.min(remaining, 90_000))];
+    // A hung call must leave time for the next model (or Gemini) within the run's budget.
+    const signals = [AbortSignal.timeout(Math.min(remaining, 45_000))];
     if (opts.signal) signals.push(opts.signal);
     try {
-      return await nvidiaGenerate(model, params, { signal: AbortSignal.any(signals) });
+      const res = await nvidiaGenerate(model, params, { signal: AbortSignal.any(signals) });
+      nvidiaFailedUntil.delete(model);
+      return res;
     } catch (err) {
       if (opts.signal?.aborted) throw err;
       if (err instanceof NvidiaError && (err.status === 401 || err.status === 403)) {
         throw new AgentError("The fallback language model rejected the server's API key. Check NVIDIA_API_KEY.");
       }
       console.warn(`[llm] nvidia ${model} failed: ${err instanceof NvidiaError ? err.status : (err as Error)?.name}`);
+      nvidiaFailedUntil.set(model, Date.now() + STICKY_MS);
       last = err;
     }
   }
@@ -110,12 +123,27 @@ export async function generateWithRetry(
     fallbacks.splice(0, fallbacks.indexOf(sticky.model) + 1);
     model = sticky.model;
   }
-  // A conversation that already failed over stays on NVIDIA: Gemini would reject its history.
+  // NVIDIA is the primary provider when configured; Gemini is the fallback. LLM_PROVIDER=gemini flips it.
+  // A conversation stays on whichever provider it started with: the other would reject its history.
   const contents = Array.isArray(params.contents) ? (params.contents as Content[]) : [];
-  // LLM_PROVIDER=nvidia skips Gemini entirely (e.g. when its daily quota is gone).
-  const forced = process.env.LLM_PROVIDER?.trim().toLowerCase() === "nvidia";
-  if (isNvidiaConfigured() && (forced || nvidiaUntil > Date.now() || contents.some((c) => (c as Tagged)[ON_NVIDIA]))) {
-    return viaNvidia(params, opts, contents);
+  const first = contents[0] as Tagged | undefined;
+  const onNvidia = contents.some((c) => (c as Tagged)[ON_NVIDIA]);
+  const onGemini = Boolean(first?.[ON_GEMINI]);
+  const geminiFirst = process.env.LLM_PROVIDER?.trim().toLowerCase() === "gemini";
+  if (isNvidiaConfigured() && !onGemini && (onNvidia || !geminiFirst || nvidiaUntil > Date.now())) {
+    try {
+      return await viaNvidia(params, opts, contents);
+    } catch (err) {
+      // NVIDIA tool-call history cannot be replayed to Gemini, so only a conversation with no
+      // model turns yet can fall back.
+      const fresh = !contents.some((c) => c.role === "model");
+      if (!fresh || err instanceof AgentError || opts.signal?.aborted || opts.deadline - Date.now() < 5_000) throw err;
+      console.warn(`[llm] nvidia failed; falling back to gemini ${params.model}`);
+      if (first) {
+        delete first[ON_NVIDIA];
+        first[ON_GEMINI] = true;
+      }
+    }
   }
   for (let attempt = 0; ; attempt++) {
     const remaining = opts.deadline - Date.now();
@@ -146,7 +174,8 @@ export async function generateWithRetry(
       }
       // Rate limited, overloaded or timed out: NVIDIA answers now instead of after a backoff.
       const timedOut = (err as Error)?.name === "TimeoutError" || (err as Error)?.name === "AbortError";
-      if (isNvidiaConfigured() && (isRetryable(err) || timedOut) && opts.deadline - Date.now() > 5_000) {
+      // Not for a conversation that already fell back from NVIDIA: it would just ping-pong.
+      if (isNvidiaConfigured() && !first?.[ON_GEMINI] && (isRetryable(err) || timedOut) && opts.deadline - Date.now() > 5_000) {
         console.warn(`[llm] gemini ${model} failed (status=${status ?? (err as Error)?.name}); switching to NVIDIA`);
         nvidiaUntil = Date.now() + STICKY_MS;
         return viaNvidia(params, opts, contents);

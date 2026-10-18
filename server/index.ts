@@ -3,6 +3,7 @@ import type { QlooClient } from "../shared/types.ts";
 import { config, missingKeys } from "./config.ts";
 import { createApp } from "./app.ts";
 import { DEFAULT_GEMINI_MODEL, type GeminiClient } from "./agent/gemini.ts";
+import { isNvidiaConfigured, nvidiaModels } from "./agent/nvidia.ts";
 import { createQlooClient, isQlooConfigured } from "./qloo/client.ts";
 import { createFileCache } from "./qloo/cache.ts";
 
@@ -25,7 +26,9 @@ function getGemini(): GeminiClient {
   return gemini;
 }
 
-const model = config.GEMINI_MODEL ?? DEFAULT_GEMINI_MODEL;
+// The primary model: NVIDIA when configured (Gemini is then the fallback), unless LLM_PROVIDER=gemini.
+const nvidiaFirst = isNvidiaConfigured() && process.env.LLM_PROVIDER?.trim().toLowerCase() !== "gemini";
+const model = nvidiaFirst ? nvidiaModels()[0]! : (config.GEMINI_MODEL ?? DEFAULT_GEMINI_MODEL);
 
 const app = createApp({
   getQloo,

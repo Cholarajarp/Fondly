@@ -145,7 +145,9 @@ export function normalizeEntity(raw: unknown): QlooEntity | undefined {
     if (contentRating) p.content_rating = contentRating;
     const price = num(props.price_level);
     if (price !== undefined) p.price_level = price;
-    const year = num(props.release_year) ?? num(props.publication_year);
+    // Video games carry only release_date ("2020-06-19"); take its year.
+    const dateYear = Number(str(props.release_date)?.match(/^(\d{4})-/)?.[1]) || undefined;
+    const year = num(props.release_year) ?? num(props.publication_year) ?? dateYear;
     if (year !== undefined) p.release_year = year;
     if (isObj(props.geocode)) {
       const g: NonNullable<NonNullable<QlooEntity["properties"]>["geocode"]> = {};

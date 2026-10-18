@@ -81,7 +81,7 @@ Both keys are required. There is no mock mode: without keys the server boots and
 
 Optional settings: `GEMINI_FALLBACK_MODELS` lists models tried in order when `GEMINI_MODEL` is overloaded (5xx) or unavailable (404). It defaults to `gemini-3.5-flash,gemini-3-flash-preview`; set it to `none` to turn fallback off. `PUBLIC_RATE_LIMIT_PER_HOUR` (20) and `DAILY_PLAN_CAP` (200) set the demo limits. All variables are listed in `.env.example`.
 
-LLM fallback: set `NVIDIA_API_KEY` (free at build.nvidia.com) and any Gemini call that is rate limited (429), overloaded or timed out switches straight to NVIDIA Nemotron (`nvidia/nemotron-3.5-super-vl-120b-a12b`, then `nvidia/nemotron-3-super-120b-a12b`) through the OpenAI-compatible API, and stays there for 10 minutes. A run that switches keeps its tool-calling history. `NVIDIA_MODELS` overrides the list; `LLM_PROVIDER=nvidia` skips Gemini entirely. `/api/health` reports `llmFallback`.
+LLM providers: with `NVIDIA_API_KEY` set (free at build.nvidia.com), NVIDIA Nemotron (`nvidia/nemotron-3.5-super-vl-120b-a12b`, then `nvidia/nemotron-3-super-120b-a12b`, OpenAI-compatible API) is the primary model and Gemini is the fallback. A run whose first NVIDIA call fails moves to Gemini and stays there; a run already on NVIDIA keeps its tool-calling history there. `NVIDIA_MODELS` overrides the list. `LLM_PROVIDER=gemini` makes Gemini primary again, with NVIDIA taking over on a 429, overload or timeout for 10 minutes. `/api/health` reports the primary `model` and `llmFallback`.
 
 ### Roster backup
 

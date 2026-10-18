@@ -353,6 +353,8 @@ export interface AgentRunAccount {
 
 export type AgentEvent =
   | { kind: "status"; message: string }
+  /** First event: the id the finished plan will be saved under, so a dropped stream can recover it. */
+  | { kind: "started"; planId: string }
   | { kind: "tool_call"; id: string; tool: string; input: unknown; /** The agent's stated reason (agent tools only), clipped. */ reason?: string }
   | { kind: "tool_result"; id: string; tool: string; ok: boolean; summary: string; ms: number }
   | { kind: "progress"; label: string; metrics: Metrics }

@@ -75,7 +75,9 @@ export const submitFamily = (token: string, submission: FamilySubmission) =>
   send<{ status: InviteStatus; submittedAt: string }>("/api/family", { method: "PUT", headers: familyHeaders(token), body: JSON.stringify(submission) });
 export const searchFamily = (token: string, kind: FavoriteKind, q: string, signal?: AbortSignal) =>
   send<{ results: FamilySuggestion[] }>(`/api/family/search?${new URLSearchParams({ kind, q })}`, { headers: familyHeaders(token), signal });
-export const getPlan = (id: string, signal?: AbortSignal) => send<WeekPlan>(`/api/plans/${encodeURIComponent(id)}`, { signal });
+export const getRunStatus = (id: string, signal?: AbortSignal) =>
+  send<{ state: "running" | "ready" | "missing" }>(`/api/plans/${encodeURIComponent(id)}/status`, { signal });
+export const getPlan =(id: string, signal?: AbortSignal) => send<WeekPlan>(`/api/plans/${encodeURIComponent(id)}`, { signal });
 export const getSessionKit = (planId: string, slotId: string, signal?: AbortSignal) =>
   send<SessionKitResponse>(`/api/plans/${encodeURIComponent(planId)}/sessions/${encodeURIComponent(slotId)}/kit`, { method: "POST", body: "{}", signal });
 export const parseIntake = (notes: string, signal?: AbortSignal) =>
@@ -138,7 +140,11 @@ async function streamEvents(url: string, body: unknown, onEvent: (e: AgentEvent)
 export const streamPlan = (req: PlanRequest, onEvent: (e: AgentEvent) => void, signal: AbortSignal) =>
   streamEvents("/api/plan", req, onEvent, signal);
 
-export const streamReplan = (planId: string, req: ReplanRequest, onEvent: (e: AgentEvent) => void, signal: AbortSignal) =>
+/** Best effort: tells the server to stop a run the user cancelled. keepalive survives page unload. */
+export const cancelRun = (planId: string) =>
+  void fetch(`/api/plans/${encodeURIComponent(planId)}/cancel`, { method: "POST", keepalive: true }).catch(() => {});
+
+export const streamReplan =(planId: string, req: ReplanRequest, onEvent: (e: AgentEvent) => void, signal: AbortSignal) =>
   streamEvents(`/api/plans/${encodeURIComponent(planId)}/replan`, req, onEvent, signal);
 
 export function describeError(err: unknown): string {

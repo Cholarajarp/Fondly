@@ -597,7 +597,21 @@ export function PlanView({ plan, roster, onReplan, onEditRoster, busy, disabledR
 
       <DiffBanner plan={plan} roster={view} />
 
-      <div className="tabs" role="tablist" aria-label="Plan sections">
+      <div
+        className="tabs"
+        role="tablist"
+        aria-label="Plan sections"
+        // Inactive tabs are out of the Tab order, so arrows, Home and End move between them (WAI-ARIA tabs).
+        onKeyDown={(e) => {
+          const i = tabs.findIndex((t) => t.id === tab);
+          const next = { ArrowRight: i + 1, ArrowLeft: i - 1, Home: 0, End: tabs.length - 1 }[e.key];
+          if (next === undefined) return;
+          e.preventDefault();
+          const t = tabs[(next + tabs.length) % tabs.length]!;
+          setTab(t.id);
+          document.getElementById(`tab-${t.id}`)?.focus();
+        }}
+      >
         {tabs.map((t) => (
           <button key={t.id} type="button" role="tab" id={`tab-${t.id}`} aria-controls={`panel-${t.id}`} aria-selected={tab === t.id} tabIndex={tab === t.id ? 0 : -1} className="tab" onClick={() => setTab(t.id)}>
             {t.label}

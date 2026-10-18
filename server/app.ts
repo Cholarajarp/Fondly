@@ -12,7 +12,7 @@ import { createPlansStore, type PlansStore } from "./plans-store.ts";
 import { createInvitesStore, type InvitesStore } from "./invites-store.ts";
 import { createFamilyRouter, type FamilyLimits } from "./routes/family.ts";
 import { createHealthRouter } from "./routes/health.ts";
-import { isNvidiaConfigured } from "./agent/nvidia.ts";
+import { isNvidiaConfigured, nvidiaModels } from "./agent/nvidia.ts";
 import { createPlanRouter, type RunAgent } from "./routes/plan.ts";
 import { createKitRouter } from "./routes/kits.ts";
 import { createKitStore, type KitStore } from "./kits/store.ts";
@@ -36,6 +36,7 @@ export interface AppDeps {
   dailyCap?: number;
   maxConcurrent?: number;
   heartbeatMs?: number;
+  detachedGraceMs?: number;
   /** Serve dist/web with SPA fallback. Defaults to NODE_ENV === "production". */
   serveStatic?: boolean;
   staticDir?: string;
@@ -104,7 +105,10 @@ export function createApp(deps: AppDeps = {}): Express {
       qlooConfigured,
       llmConfigured: deps.llmConfigured ?? (() => !missingKeys().includes("GEMINI_API_KEY")),
       llmFallbackConfigured: deps.llmFallbackConfigured ?? isNvidiaConfigured,
-      model: deps.model ?? config.GEMINI_MODEL,
+      // The badge names the primary model: NVIDIA when configured (unless LLM_PROVIDER=gemini).
+      model:
+        deps.model ??
+        (isNvidiaConfigured() && process.env.LLM_PROVIDER?.trim().toLowerCase() !== "gemini" ? nvidiaModels()[0] : config.GEMINI_MODEL),
     }),
   );
 
@@ -120,6 +124,7 @@ export function createApp(deps: AppDeps = {}): Express {
       dailyCap: deps.dailyCap ?? config.DAILY_PLAN_CAP,
       maxConcurrent: deps.maxConcurrent ?? 3,
       heartbeatMs: deps.heartbeatMs,
+      detachedGraceMs: deps.detachedGraceMs,
     }),
   );
 

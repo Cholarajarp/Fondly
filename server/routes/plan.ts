@@ -32,6 +32,8 @@ export interface PlanRouteDeps {
   dailyCap: number;
   maxConcurrent: number;
   heartbeatMs?: number;
+  /** How long a run keeps going after its stream drops, so the plan is still saved (default 210s, longer than a full run). */
+  detachedGraceMs?: number;
 }
 
 function createDailyCounter(cap: number) {
@@ -112,6 +114,8 @@ export function createPlanRouter(deps: PlanRouteDeps): Router {
   // Intake is one small LLM call; cap it separately so it cannot drain the daily LLM budget.
   const dailyIntake = createDailyCounter(deps.dailyCap * 10);
   let running = 0;
+  /** In-flight runs by the plan id they will save under; the id is the cancel capability. */
+  const active = new Map<string, AbortController>();
 
   const limiter = (limit: number) =>
     rateLimit({
@@ -167,10 +171,18 @@ export function createPlanRouter(deps: PlanRouteDeps): Router {
   ) {
     running++;
     const controller = new AbortController();
+    const planId = randomUUID();
+    active.set(planId, controller);
     let closed = false;
+    let grace: ReturnType<typeof setTimeout> | undefined;
+    // A dropped connection (proxy cut, flaky Wi-Fi) is not a cancel: keep building for a while so the
+    // plan is saved and the client can fetch it by id. Cancel is explicit: POST /plans/:id/cancel.
     res.on("close", () => {
       closed = true;
-      if (!res.writableFinished) controller.abort();
+      if (!res.writableFinished && !controller.signal.aborted) {
+        grace = setTimeout(() => controller.abort(), deps.detachedGraceMs ?? 210_000);
+        grace.unref?.();
+      }
     });
     res.status(200);
     res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
@@ -186,6 +198,7 @@ export function createPlanRouter(deps: PlanRouteDeps): Router {
       if (e.kind !== "done" && e.kind !== "error") emit(e);
     };
     const heartbeat = setInterval(() => write(": ping\n\n"), heartbeatMs);
+    emit({ kind: "started", planId });
     try {
       const request = await prelude(agentEmit, initial);
       const plan = await run(request, {
@@ -196,7 +209,7 @@ export function createPlanRouter(deps: PlanRouteDeps): Router {
         ...extra,
       });
       if (controller.signal.aborted) return;
-      if (!isValidPlanId(plan.id)) plan.id = randomUUID();
+      plan.id = planId;
       decorate(plan);
       // A full disk or write error must not throw away a plan that took minutes to build.
       try {
@@ -212,10 +225,19 @@ export function createPlanRouter(deps: PlanRouteDeps): Router {
       }
     } finally {
       clearInterval(heartbeat);
+      clearTimeout(grace);
+      active.delete(planId);
       running--;
       if (!res.writableEnded) res.end();
     }
   }
+
+  // Only the client that received the run's id (from its own stream) can cancel it.
+  router.post("/plans/:id/cancel", (req, res) => {
+    const ctl = isValidPlanId(req.params.id) ? active.get(req.params.id) : undefined;
+    ctl?.abort();
+    res.json({ cancelled: Boolean(ctl) });
+  });
 
   router.post("/plan", requireConfig, planLimiter, (req, res) => {
     const parsed = PlanRequestSchema.safeParse(req.body);
@@ -364,6 +386,22 @@ export function createPlanRouter(deps: PlanRouteDeps): Router {
       res.json(await parseIntake(deps.getGemini(), parsed.data.notes));
     } catch (err) {
       res.status(502).json({ error: friendlyError(err) });
+    }
+  });
+
+  // Lets a client whose stream dropped wait for its run without 404 noise:
+  // "running" (keep waiting), "ready" (fetch it) or "missing" (the run ended without a plan).
+  router.get("/plans/:id/status", readLimiter, async (req, res, next) => {
+    try {
+      const { id } = req.params;
+      if (!isValidPlanId(id)) {
+        res.status(400).json({ error: "Invalid plan id" });
+        return;
+      }
+      const state = active.has(id) ? "running" : (await deps.store.getPlan(id)) ? "ready" : "missing";
+      res.json({ state });
+    } catch (err) {
+      next(err);
     }
   });
 

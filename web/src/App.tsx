@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { AgentEvent, WeekPlan } from "../../shared/types";
-import { describeError, getHealth, getPlan, streamPlan, streamReplan } from "./api";
+import { ApiError, cancelRun, describeError, getHealth, getPlan, getRunStatus, streamPlan, streamReplan } from "./api";
 import { AgentTimeline, applyEvent, emptyTimeline, type TimelineState } from "./components/AgentTimeline";
 import { ErrorPanel } from "./components/ErrorPanel";
 import { Header, isHealthy, type HealthState } from "./components/Header";
@@ -98,6 +98,8 @@ function App() {
   const [view, setView] = useState<View>({ name: "idle" });
   const [timeline, setTimeline] = useState<TimelineState>(emptyTimeline);
   const runRef = useRef<AbortController | null>(null);
+  /** Server id of the run in progress, so Cancel can stop it (a dropped stream alone does not). */
+  const cancelRef = useRef<string | null>(null);
   const seq = useRef(0);
   const mainRef = useRef<HTMLElement>(null);
 
@@ -133,15 +135,21 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [route]);
 
-  useEffect(() => () => runRef.current?.abort(), []);
+  /** Stops the run in progress, on the server as well: a closed stream alone keeps it building. */
+  const stopRun = useCallback(() => {
+    if (cancelRef.current) cancelRun(cancelRef.current);
+    cancelRef.current = null;
+    runRef.current?.abort();
+  }, []);
+  useEffect(() => () => stopRun(), [stopRun]);
 
   const goHome = useCallback(() => {
-    runRef.current?.abort();
+    stopRun();
     setView({ name: "idle" });
     if (window.location.hash) window.history.pushState(null, "", window.location.pathname);
     setRoute({ name: "home" });
     window.scrollTo({ top: 0 });
-  }, []);
+  }, [stopRun]);
 
   const toSetup = useCallback(() => {
     goHome();
@@ -150,29 +158,59 @@ function App() {
 
   const run = useCallback(
     async (title: string, start: (onEvent: (e: AgentEvent) => void, signal: AbortSignal) => Promise<void>, retry: () => void) => {
-      runRef.current?.abort();
+      stopRun();
       const ctl = new AbortController();
       runRef.current = ctl;
       setTimeline(emptyTimeline());
       setView({ name: "running", title });
       window.scrollTo({ top: 0, behavior: "smooth" });
       let finished = false;
+      let planId: string | undefined;
+      const show = (plan: WeekPlan) => {
+        finished = true;
+        // Fold the server's request back in (re-plans may add residents or change availability).
+        updateRoster((r) => ({
+          ...(plan.request.rosterId === r.rosterId ? mergeRequest(r, plan.request) : r),
+          lastPlanId: plan.id,
+          planHistory: [plan.id, ...r.planHistory.filter((x) => x !== plan.id)].slice(0, 20),
+        }));
+        setView({ name: "plan", plan });
+        window.history.pushState(null, "", `#/plan/${plan.id}`);
+        setRoute({ name: "plan", id: plan.id });
+        requestAnimationFrame(() => mainRef.current?.focus());
+      };
+      // The server keeps building after a dropped connection and saves under the id it sent first,
+      // so a cut stream (proxy, Wi-Fi) waits for the saved plan instead of failing.
+      const recover = async (): Promise<boolean> => {
+        if (!planId || ctl.signal.aborted) return false;
+        setTimeline((t) => applyEvent(t, { kind: "status", message: "Connection dropped; waiting for the plan to finish saving" }, ++seq.current));
+        const until = Date.now() + 220_000;
+        while (Date.now() < until && !ctl.signal.aborted) {
+          await new Promise((r) => setTimeout(r, 5_000));
+          try {
+            const { state } = await getRunStatus(planId, ctl.signal);
+            if (state === "missing") return false; // the run ended without a plan
+            if (state === "running") continue;
+            const plan = await getPlan(planId, ctl.signal);
+            if (!ctl.signal.aborted) show(plan);
+            return true;
+          } catch (err) {
+            if (ctl.signal.aborted) return false;
+            // 0: network blip, 429: polled too fast; keep waiting. Anything else is final.
+            if (!(err instanceof ApiError) || (err.status !== 0 && err.status !== 429)) return false;
+          }
+        }
+        return false;
+      };
+      const closedEarly = { name: "error" as const, title: "The connection closed early", message: "The server stopped before the plan was ready. Please try again.", retry };
       try {
         await start((ev) => {
           if (ctl.signal.aborted) return;
-          if (ev.kind === "done") {
-            finished = true;
-            const plan = ev.plan;
-            // Fold the server's request back in (re-plans may add residents or change availability).
-            updateRoster((r) => ({
-              ...(plan.request.rosterId === r.rosterId ? mergeRequest(r, plan.request) : r),
-              lastPlanId: plan.id,
-              planHistory: [plan.id, ...r.planHistory.filter((x) => x !== plan.id)].slice(0, 20),
-            }));
-            setView({ name: "plan", plan });
-            window.history.pushState(null, "", `#/plan/${plan.id}`);
-            setRoute({ name: "plan", id: plan.id });
-            requestAnimationFrame(() => mainRef.current?.focus());
+          if (ev.kind === "started") {
+            planId = ev.planId;
+            cancelRef.current = ev.planId;
+          } else if (ev.kind === "done") {
+            show(ev.plan);
           } else if (ev.kind === "error") {
             finished = true;
             setView({ name: "error", title: "The plan couldn't be finished", message: ev.message, retry });
@@ -180,15 +218,22 @@ function App() {
             setTimeline((t) => applyEvent(t, ev, ++seq.current));
           }
         }, ctl.signal);
-        if (!finished && !ctl.signal.aborted) setView({ name: "error", title: "The connection closed early", message: "The server stopped before the plan was ready. Please try again.", retry });
+        if (!finished && !(await recover()) && !ctl.signal.aborted) setView(closedEarly);
       } catch (err) {
         if (ctl.signal.aborted) return;
+        if (planId && !finished) {
+          if (!(await recover()) && !ctl.signal.aborted) setView(closedEarly);
+          return;
+        }
         setView({ name: "error", title: "The plan couldn't be started", message: describeError(err), retry });
       } finally {
-        if (runRef.current === ctl) runRef.current = null;
+        if (runRef.current === ctl) {
+          runRef.current = null;
+          cancelRef.current = null;
+        }
       }
     },
-    [updateRoster],
+    [updateRoster, stopRun],
   );
 
   const planWeek = useCallback(() => {
@@ -212,11 +257,11 @@ function App() {
   );
 
   const cancel = useCallback(() => {
-    runRef.current?.abort();
+    stopRun();
     runRef.current = null;
     setView({ name: "idle" });
     if (route.name === "plan") window.history.back();
-  }, [route]);
+  }, [route, stopRun]);
 
   const ready = isHealthy(health);
   const intakeEnabled = health.state === "ready" && health.health.llm;

@@ -58,9 +58,18 @@ const MATURE_TAG = /:(blood_soaked|gory|gore|mature_themes|graphic_violence|sexu
  * True when a discovered title suits a group session in a care home. Residents' own stated
  * favorites are never filtered (staff already know them); this only gates recommendations.
  */
+/** Newest release year a recommended (not favorite) video game may have. */
+export const CLASSIC_GAME_MAX_YEAR = 2010;
+const isGame = (e: QlooEntity) => e.type === "urn:entity:videogame" || e.subtype === "urn:entity:videogame";
+
 export function suitableForGroup(e: QlooEntity): boolean {
   const rating = e.properties?.content_rating?.trim().toUpperCase();
   if (rating && MATURE_RATINGS.has(rating)) return false;
+  // Qloo ignores the release-year filter for games and recommends current console titles; a care
+  // home's games club plays classics (Tetris, Wii Bowling). A suggested game needs a known classic
+  // year; residents' own favorite games never pass through here.
+  const year = e.properties?.release_year;
+  if (isGame(e) && !(typeof year === "number" && year <= CLASSIC_GAME_MAX_YEAR)) return false;
   return !e.tags?.some((t) => MATURE_TAG.test(t.id) || NOT_AN_OUTING.test(t.id));
 }
 
