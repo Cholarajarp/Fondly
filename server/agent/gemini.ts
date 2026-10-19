@@ -85,10 +85,17 @@ async function viaNvidia(params: GenerateContentParameters, opts: RetryOpts, con
   const now = Date.now();
   const models = nvidiaModels();
   const order = [...models.filter((m) => !(nvidiaFailedUntil.get(m)! > now)), ...models.filter((m) => nvidiaFailedUntil.get(m)! > now)];
+  // A conversation with no model turns can still fall back to Gemini, so NVIDIA gets 60% of its
+  // budget and Gemini keeps the rest. Mid-conversation, NVIDIA is the only option and gets it all.
+  const fresh = !contents.some((c) => c.role === "model");
+  const until = fresh ? now + Math.floor((opts.deadline - now) * 0.6) : opts.deadline;
   for (const model of order) {
-    const remaining = opts.deadline - Date.now();
-    if (remaining <= 500) throw new AgentError("Time budget reached");
-    // A hung call must leave time for the next model (or Gemini) within the run's budget.
+    const remaining = until - Date.now();
+    if (remaining <= 500) {
+      if (last) break;
+      throw new AgentError("Time budget reached");
+    }
+    // A hung call must leave time for the next model within the budget.
     const signals = [AbortSignal.timeout(Math.min(remaining, 45_000))];
     if (opts.signal) signals.push(opts.signal);
     try {
@@ -137,7 +144,8 @@ export async function generateWithRetry(
       // NVIDIA tool-call history cannot be replayed to Gemini, so only a conversation with no
       // model turns yet can fall back.
       const fresh = !contents.some((c) => c.role === "model");
-      if (!fresh || err instanceof AgentError || opts.signal?.aborted || opts.deadline - Date.now() < 5_000) throw err;
+      // viaNvidia keeps 40% of a fresh call's budget in reserve, so Gemini gets a real window.
+      if (!fresh || err instanceof AgentError || opts.signal?.aborted || opts.deadline - Date.now() < 1_000) throw err;
       console.warn(`[llm] nvidia failed; falling back to gemini ${params.model}`);
       if (first) {
         delete first[ON_NVIDIA];
